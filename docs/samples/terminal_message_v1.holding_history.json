@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "type": "holding_name_click_response",
+  "event_id": "holding-history-00700.HK-000001",
+  "symbol": "00700.HK",
+  "source": "gateway",
+  "source_ts": "2026-05-22T09:30:00.000+08:00",
+  "ingest_ts": "2026-05-22T09:30:00.010+08:00",
+  "seq": 1,
+  "payload": {
+    "participant_name": "JPMorgan Chase Bank, N.A.",
+    "days": 2,
+    "history": [
+      {
+        "date": "2026-05-21",
+        "shares": 1000000,
+        "percent": 1.1,
+        "change": 10000
+      },
+      {
+        "date": "2026-05-22",
+        "shares": 1010000,
+        "percent": 1.11,
+        "change": 10000
+      }
+    ],
+    "freshness": {
+      "updated_at": "2026-05-22T09:30:00.010+08:00"
+    }
+  }
+}

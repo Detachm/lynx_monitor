@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Node / frontend build
+node_modules/
+dist/
+dist-electron/
+coverage/
+*.tsbuildinfo
+*.local
+
+# Runtime artifacts
+artifacts/
+*.log
+.DS_Store

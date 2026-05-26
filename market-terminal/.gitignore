@@ -1,0 +1,9 @@
+node_modules/
+dist/
+dist-electron/
+release/
+coverage/
+*.local
+.DS_Store
+*.tsbuildinfo
+node_modules/.tmp/

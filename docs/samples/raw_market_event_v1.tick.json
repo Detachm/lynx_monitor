@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "kind": "tick",
+  "event_id": "raw-xtquant-00700.HK-20260522-093000000-000001",
+  "symbol": "00700.HK",
+  "source": "xtquant",
+  "period": "tick",
+  "source_ts": "2026-05-22T09:30:00.000+08:00",
+  "ingest_ts": "2026-05-22T09:30:00.004+08:00",
+  "seq": 1,
+  "payload": {
+    "price": 388.4,
+    "volume": 100000,
+    "turnover": 38840000,
+    "side": "buy",
+    "broker_code": "JPM"
+  }
+}

@@ -1,0 +1,60 @@
+{
+  "schema_version": 1,
+  "type": "snapshot",
+  "event_id": "snapshot-00700.HK-20260522-000001",
+  "symbol": "00700.HK",
+  "source": "gateway",
+  "source_ts": "2026-05-22T09:30:00.000+08:00",
+  "ingest_ts": "2026-05-22T09:30:00.020+08:00",
+  "seq": 1,
+  "payload": {
+    "snapshot": {
+      "symbol": "00700.HK",
+      "name": "Tencent Holdings",
+      "currency": "HKD",
+      "tradeDate": "20260522",
+      "requestedTradeDate": "20260525",
+      "isHistoricalSession": true,
+      "price": 388.4,
+      "previousClose": 382.0,
+      "open": 387.2,
+      "high": 389.0,
+      "low": 386.8,
+      "volume": 100000,
+      "turnover": 38840000,
+      "change": 6.4,
+      "changePercent": 1.68,
+      "updatedAt": "2026-05-22T09:30:00.020+08:00"
+    },
+    "minute_bars": [],
+    "alerts": [],
+    "broker_queue": {
+      "ask": [],
+      "bid": []
+    },
+    "ccass_holdings": [
+      {
+        "participantName": "JPMorgan Chase Bank, N.A.",
+        "participantCode": "C00010",
+        "shares": 1000000,
+        "percent": 1.1,
+        "change": 10000,
+        "date": "20260522",
+        "current_date": "20260522",
+        "previous_date": "20260521",
+        "isHighlighted": true
+      }
+    ],
+    "ccass_evidence": {
+      "date": "20260522",
+      "current_date": "20260522",
+      "previous_date": "20260521"
+    },
+    "freshness": {
+      "updated_at": "2026-05-22T09:30:00.020+08:00",
+      "source_ts": "2026-05-22T09:30:00.000+08:00",
+      "ingest_ts": "2026-05-22T09:30:00.020+08:00",
+      "degraded": false
+    }
+  }
+}

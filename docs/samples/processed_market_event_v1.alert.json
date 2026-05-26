@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "result_type": "big_trade_alert",
+  "event_id": "processed-octopus-00700.HK-20260522-093000020-000001",
+  "symbol": "00700.HK",
+  "source": "octopus",
+  "source_ts": "2026-05-22T09:30:00.000+08:00",
+  "ingest_ts": "2026-05-22T09:30:00.020+08:00",
+  "seq": 1,
+  "payload": {
+    "alert": {
+      "id": "alert-00700.HK-000001",
+      "timestamp": "2026-05-22T09:30:00.000+08:00",
+      "price": 388.4,
+      "volume": 300000,
+      "turnover": 116520000,
+      "side": "buy",
+      "participantName": "JPMorgan Chase Bank, N.A.",
+      "brokerName": "JPMorgan Chase Bank, N.A.",
+      "remark": "Aggressive buy",
+      "isHighlighted": true
+    }
+  }
+}

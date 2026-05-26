@@ -1,0 +1,61 @@
+{
+  "name": "market-terminal",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Multi-stock real-time monitoring terminal",
+  "engines": {
+    "node": "^20.19.0 || >=22.12.0"
+  },
+  "packageManager": "pnpm@10.0.0",
+  "main": "dist-electron/main.js",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0 --strictPort",
+    "build": "run-p type-check build-only build:electron",
+    "build-only": "vite build",
+    "build:electron": "tsc -p tsconfig.electron.json",
+    "preview": "vite preview --host 0.0.0.0 --strictPort",
+    "test": "vitest run",
+    "test:unit": "vitest",
+    "type-check": "vue-tsc --build",
+    "electron:dev": "concurrently -k \"vite --host 0.0.0.0 --strictPort\" \"wait-on tcp:5173 && pnpm build:electron && cross-env VITE_DEV_SERVER_URL=http://127.0.0.1:5173 electron .\"",
+    "electron:build": "pnpm build && electron-builder"
+  },
+  "dependencies": {
+    "echarts": "^6.0.0",
+    "@lucide/vue": "^1.16.0",
+    "pinia": "^3.0.4",
+    "vue": "^3.5.25",
+    "vue-router": "^4.6.3"
+  },
+  "devDependencies": {
+    "@tsconfig/node24": "^24.0.3",
+    "@types/jsdom": "^27.0.0",
+    "@types/node": "^24.10.1",
+    "@vitejs/plugin-vue": "^6.0.2",
+    "@vue/test-utils": "^2.4.6",
+    "@vue/tsconfig": "^0.8.1",
+    "concurrently": "^9.2.1",
+    "cross-env": "^10.1.0",
+    "electron": "^39.2.7",
+    "electron-builder": "^26.0.12",
+    "jsdom": "^27.2.0",
+    "npm-run-all2": "^8.0.4",
+    "typescript": "~5.9.0",
+    "vite": "^7.2.4",
+    "vitest": "^4.0.14",
+    "vue-tsc": "^3.1.5",
+    "wait-on": "^9.0.1"
+  },
+  "build": {
+    "appId": "com.lishihao.market-terminal",
+    "productName": "Market Terminal",
+    "files": [
+      "dist/**/*",
+      "dist-electron/**/*"
+    ],
+    "directories": {
+      "output": "release"
+    }
+  }
+}
