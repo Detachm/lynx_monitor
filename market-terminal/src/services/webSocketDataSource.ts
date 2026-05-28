@@ -15,6 +15,7 @@ export class WebSocketDataSource implements MarketDataSource {
   private socket: WebSocket | null = null
   private readonly handlers = new Set<MarketMessageHandler>()
   private readonly health = new TerminalHealthTracker()
+  private readonly desiredSubscriptions = new Set<StockSymbol>()
   private readonly pendingSubscribes = new Map<
     StockSymbol,
     {
@@ -23,27 +24,41 @@ export class WebSocketDataSource implements MarketDataSource {
       timer: ReturnType<typeof globalThis.setTimeout>
     }
   >()
+  private connectPromise: Promise<void> | null = null
+  private reconnectTimer: ReturnType<typeof globalThis.setTimeout> | null = null
+  private reconnectAttempts = 0
+  private manuallyDisconnected = false
 
   constructor(
     private readonly url: string,
     private readonly protocol: string = TERMINAL_MESSAGE_PROTOCOL,
     private readonly subscribeAckTimeoutMs = 120_000,
     private readonly clientId: string = '',
+    private readonly reconnectBaseDelayMs = 1_000,
+    private readonly reconnectMaxDelayMs = 30_000,
   ) {}
 
   connect(): Promise<void> {
     if (this.socket?.readyState === WebSocket.OPEN) {
       return Promise.resolve()
     }
+    if (this.connectPromise) {
+      return this.connectPromise
+    }
+    this.manuallyDisconnected = false
+    this.clearReconnectTimer()
 
-    return new Promise((resolve, reject) => {
+    this.connectPromise = new Promise((resolve, reject) => {
       const socket = new WebSocket(this.url)
       this.socket = socket
 
       socket.addEventListener(
         'open',
         () => {
+          this.connectPromise = null
+          this.reconnectAttempts = 0
           this.health.update({ process: 'running' })
+          this.restoreSubscriptions()
           resolve()
         },
         { once: true },
@@ -51,8 +66,10 @@ export class WebSocketDataSource implements MarketDataSource {
       socket.addEventListener(
         'error',
         () => {
+          this.connectPromise = null
           this.health.update({ process: 'degraded' })
           reject(new Error(`Unable to connect to ${this.url}`))
+          this.scheduleReconnect()
         },
         { once: true },
       )
@@ -86,13 +103,18 @@ export class WebSocketDataSource implements MarketDataSource {
         if (this.socket === socket) {
           this.socket = null
         }
+        this.connectPromise = null
         this.rejectPendingSubscribes(new Error('WebSocket connection closed'))
         this.health.update({ process: 'stopped' })
+        this.scheduleReconnect()
       })
     })
+    return this.connectPromise
   }
 
   disconnect() {
+    this.manuallyDisconnected = true
+    this.clearReconnectTimer()
     this.socket?.close()
     this.socket = null
     this.rejectPendingSubscribes(new Error('WebSocket connection closed'))
@@ -100,6 +122,7 @@ export class WebSocketDataSource implements MarketDataSource {
 
   subscribe(rawSymbol: StockSymbol) {
     const symbol = normalizeStockSymbol(rawSymbol)
+    this.desiredSubscriptions.add(symbol)
     if (this.pendingSubscribes.has(symbol)) {
       return new Promise<void>((resolve, reject) => {
         const previous = this.pendingSubscribes.get(symbol)!
@@ -123,7 +146,13 @@ export class WebSocketDataSource implements MarketDataSource {
       }, this.subscribeAckTimeoutMs)
       this.pendingSubscribes.set(symbol, { resolve, reject, timer })
       try {
-        this.send({ action: 'subscribe', symbol })
+        if (this.socket?.readyState === WebSocket.OPEN) {
+          this.send({ action: 'subscribe', symbol })
+        } else {
+          void this.connect().catch((error) => {
+            this.rejectPendingSubscribe(symbol, error instanceof Error ? error : new Error(String(error)))
+          })
+        }
       } catch (error) {
         globalThis.clearTimeout(timer)
         this.pendingSubscribes.delete(symbol)
@@ -134,6 +163,7 @@ export class WebSocketDataSource implements MarketDataSource {
 
   unsubscribe(rawSymbol: StockSymbol) {
     const symbol = normalizeStockSymbol(rawSymbol)
+    this.desiredSubscriptions.delete(symbol)
     this.rejectPendingSubscribe(symbol, new Error(`Subscribe cancelled: ${symbol}`))
     this.send({ action: 'unsubscribe', symbol })
   }
@@ -163,6 +193,42 @@ export class WebSocketDataSource implements MarketDataSource {
     }
 
     this.socket.send(JSON.stringify(gatewayRequestPayload(payload, this.protocol, this.clientId)))
+  }
+
+  private restoreSubscriptions() {
+    for (const symbol of this.desiredSubscriptions) {
+      try {
+        this.send({ action: 'subscribe', symbol })
+      } catch (error) {
+        this.rejectPendingSubscribe(symbol, error instanceof Error ? error : new Error(String(error)))
+      }
+    }
+  }
+
+  private scheduleReconnect() {
+    if (this.manuallyDisconnected || this.reconnectTimer || this.desiredSubscriptions.size === 0) {
+      return
+    }
+    const delay = Math.min(
+      this.reconnectMaxDelayMs,
+      this.reconnectBaseDelayMs * 2 ** this.reconnectAttempts,
+    )
+    this.reconnectAttempts += 1
+    this.health.update({ process: 'degraded' })
+    this.reconnectTimer = globalThis.setTimeout(() => {
+      this.reconnectTimer = null
+      void this.connect().catch(() => {
+        this.scheduleReconnect()
+      })
+    }, delay)
+  }
+
+  private clearReconnectTimer() {
+    if (!this.reconnectTimer) {
+      return
+    }
+    globalThis.clearTimeout(this.reconnectTimer)
+    this.reconnectTimer = null
   }
 
   private resolvePendingSubscribe(symbol: StockSymbol) {

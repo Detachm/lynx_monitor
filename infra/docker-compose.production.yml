@@ -1,0 +1,123 @@
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:v24.3.7
+    command:
+      - redpanda
+      - start
+      - --overprovisioned
+      - --smp
+      - "1"
+      - --memory
+      - 1G
+      - --reserve-memory
+      - 0M
+      - --node-id
+      - "0"
+      - --check=false
+      - --kafka-addr
+      - INTERNAL://0.0.0.0:9092,OUTSIDE://0.0.0.0:19092
+      - --advertise-kafka-addr
+      - INTERNAL://redpanda:9092,OUTSIDE://127.0.0.1:19092
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:19092:19092"
+      - "127.0.0.1:9644:9644"
+    volumes:
+      - redpanda-data:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health --brokers redpanda:9092 | grep -E 'Healthy:.+true'"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+
+  backend:
+    build:
+      context: ..
+      dockerfile: backend/Dockerfile.production
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+      redpanda:
+        condition: service_healthy
+    environment:
+      TZ: Asia/Shanghai
+      RUNTIME_TRADE_DATE: ${RUNTIME_TRADE_DATE:-}
+      RUNTIME_START_AT: ${RUNTIME_START_AT:-09:25}
+      WAIT_FOR_MARKET_START: ${WAIT_FOR_MARKET_START:-true}
+      SILVER_ROOT: /data/silver
+      ARTIFACT_DIR: /app/artifacts
+      RUNTIME_STATE_ROOT: /app/artifacts/runtime-state
+      KAFKA_SPOOL_DIR: /app/artifacts/runtime-state/kafka-spool
+      KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
+      REDIS_URL: redis://redis:6379/0
+      GATEWAY_HOST: 0.0.0.0
+      GATEWAY_PORT: "9020"
+      ACTIVE_POOL_TARGET_SIZE: ${ACTIVE_POOL_TARGET_SIZE:-200}
+      ACTIVE_POOL_PINNED_MAX_SIZE: ${ACTIVE_POOL_PINNED_MAX_SIZE:-100}
+      ACTIVE_POOL_RANK_WINDOW_DAYS: ${ACTIVE_POOL_RANK_WINDOW_DAYS:-5}
+      ACTIVE_POOL_RANK_METRIC: ${ACTIVE_POOL_RANK_METRIC:-avg_turnover}
+      FRESHNESS_MAX_EVENT_AGE_SECONDS: ${FRESHNESS_MAX_EVENT_AGE_SECONDS:-900}
+      KAFKA_POLL_TIMEOUT_MS: ${KAFKA_POLL_TIMEOUT_MS:-1}
+      HEALTH_SNAPSHOT_EVERY_TICKS: ${HEALTH_SNAPSHOT_EVERY_TICKS:-20}
+      HEALTH_SNAPSHOT_INTERVAL_SECONDS: ${HEALTH_SNAPSHOT_INTERVAL_SECONDS:-5}
+      RUNTIME_HEALTH_MAX_AGE_SECONDS: ${RUNTIME_HEALTH_MAX_AGE_SECONDS:-60}
+      TICK_INTERVAL_SECONDS: ${TICK_INTERVAL_SECONDS:-0.1}
+      XTQUANT_SDK_PATH: /xtquant/sdk
+      XTQUANT_DATA_HOME: /xtquant/data
+      XTQUANT_PORT: ${XTQUANT_PORT:-58628}
+      XTQUANT_TOKEN: ${XTQUANT_TOKEN:-}
+      RUNTIME_SYMBOLS: ${RUNTIME_SYMBOLS:-}
+      HYDRATE_HISTORICAL_ALERTS: ${HYDRATE_HISTORICAL_ALERTS:-false}
+      DISABLE_XTQUANT: ${DISABLE_XTQUANT:-false}
+      DISABLE_DUCKDB: ${DISABLE_DUCKDB:-false}
+    ports:
+      - "0.0.0.0:9020:9020"
+    volumes:
+      - ../artifacts:/app/artifacts
+      - ${SILVER_ROOT:-../data/silver}:/data/silver:ro
+      - ${XTQUANT_SDK_PATH:-/home/hliu/xtbackend/vendor/xtquant_251211_interim-release_cp36m-37m-38-39-310-311-312_linux-gnu_x86_64}:/xtquant/sdk:ro
+      - ${XTQUANT_DATA_HOME:-../artifacts/xtquant-data}:/xtquant/data
+    healthcheck:
+      test: ["CMD-SHELL", "PYTHONPATH=/app/backend python -m beast_market.healthcheck --path /app/artifacts/runtime-health.json --max-age-seconds $${RUNTIME_HEALTH_MAX_AGE_SECONDS:-60}"]
+      interval: 15s
+      timeout: 3s
+      retries: 20
+
+  frontend:
+    build:
+      context: ..
+      dockerfile: market-terminal/Dockerfile.production
+      args:
+        VITE_MARKET_DATA_MODE: live
+        VITE_MARKET_PROTOCOL: terminal-message-v1
+        VITE_MARKET_SYMBOLS: ${VITE_MARKET_SYMBOLS:-00700.HK,00939.HK,02643.HK,00108.HK}
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_started
+    ports:
+      - "0.0.0.0:5173:80"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/healthz | grep ok"]
+      interval: 15s
+      timeout: 3s
+      retries: 12
+
+volumes:
+  redis-data:
+  redpanda-data:

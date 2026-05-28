@@ -12,6 +12,7 @@ from .symbol_runtime import SymbolRuntimeManager
 
 
 HistoryProvider = Callable[[str, str, int], list[dict[str, Any]]]
+RealtimeSeedProvider = Callable[[str], Any]
 MAX_PERFORMANCE_SAMPLES = 500
 
 
@@ -20,6 +21,7 @@ class GatewaySession:
     client_id: str
     queue: GatewayClientQueue
     subscribed_symbols: set[str] = field(default_factory=set)
+    attached_runtime_symbols: set[str] = field(default_factory=set)
 
 
 class GatewayV2SessionManager:
@@ -37,6 +39,7 @@ class GatewayV2SessionManager:
         history_provider: HistoryProvider | None = None,
         client_queue_size: int = 100,
         symbol_runtime_manager: SymbolRuntimeManager | None = None,
+        realtime_seed_provider: RealtimeSeedProvider | None = None,
         consume_processed_on_broadcast: bool = True,
     ) -> None:
         self.gateway = gateway
@@ -44,6 +47,7 @@ class GatewayV2SessionManager:
         self.history_provider = history_provider or empty_history
         self.client_queue_size = client_queue_size
         self.symbol_runtime_manager = symbol_runtime_manager
+        self.realtime_seed_provider = realtime_seed_provider
         self.consume_processed_on_broadcast = consume_processed_on_broadcast
         self.sessions: dict[str, GatewaySession] = {}
         self.observed_client_ids: set[str] = set()
@@ -66,7 +70,7 @@ class GatewayV2SessionManager:
     def disconnect(self, client_id: str) -> None:
         session = self.sessions.pop(client_id, None)
         if session is not None and self.symbol_runtime_manager is not None:
-            for symbol in list(session.subscribed_symbols):
+            for symbol in list(session.attached_runtime_symbols):
                 self.symbol_runtime_manager.detach(symbol, client_id)
 
     def handle_message(self, client_id: str, raw_message: str | dict[str, Any]) -> None:
@@ -80,8 +84,14 @@ class GatewayV2SessionManager:
         if action == "subscribe":
             require_gateway_symbol(symbol, "subscribe")
             started = perf_counter()
-            if self.symbol_runtime_manager is not None:
+            fast_snapshot = self._active_runtime_snapshot(symbol) if self.symbol_runtime_manager is not None else None
+            if fast_snapshot is not None:
+                if self.symbol_runtime_manager is not None and self.symbol_runtime_manager.retain_existing_runtime(symbol, client_id):
+                    session.attached_runtime_symbols.add(symbol)
+                snapshot = fast_snapshot
+            elif self.symbol_runtime_manager is not None:
                 snapshot = self.symbol_runtime_manager.attach(symbol, client_id)
+                session.attached_runtime_symbols.add(symbol)
             else:
                 snapshot = self.gateway.subscribe(symbol, self.trade_date)
             session.subscribed_symbols.add(symbol)
@@ -90,7 +100,8 @@ class GatewayV2SessionManager:
         elif action == "unsubscribe":
             require_gateway_symbol(symbol, "unsubscribe")
             session.subscribed_symbols.discard(symbol)
-            if self.symbol_runtime_manager is not None:
+            if self.symbol_runtime_manager is not None and symbol in session.attached_runtime_symbols:
+                session.attached_runtime_symbols.discard(symbol)
                 self.symbol_runtime_manager.detach(symbol, client_id)
         elif action == "holding_name_click":
             require_gateway_symbol(symbol, "holding_name_click")
@@ -176,6 +187,25 @@ class GatewayV2SessionManager:
         if isinstance(client_id, str) and client_id.strip():
             self.observed_declared_client_ids.add(client_id.strip())
 
+    def _active_runtime_snapshot(self, symbol: str) -> dict[str, Any] | None:
+        if self.symbol_runtime_manager is None:
+            return None
+        state = self.symbol_runtime_manager.runtime_state_payload(symbol)
+        if not isinstance(state, dict) or state.get("realtime_attached") is not True:
+            return None
+        payload = self.symbol_runtime_manager.snapshot_payload(symbol)
+        if not isinstance(payload, dict):
+            return None
+        if snapshot_needs_realtime_seed(payload, self.trade_date) and self.realtime_seed_provider is not None:
+            try:
+                self.realtime_seed_provider(symbol)
+            except Exception:
+                pass
+            refreshed = self.symbol_runtime_manager.snapshot_payload(symbol)
+            if isinstance(refreshed, dict):
+                payload = refreshed
+        return self.gateway.snapshot_message(symbol, payload)
+
     def _session(self, client_id: str) -> GatewaySession:
         if client_id not in self.sessions:
             raise KeyError(f"unknown gateway client: {client_id}")
@@ -219,3 +249,15 @@ def require_gateway_symbol(symbol: str, action: str) -> None:
 
 def empty_history(symbol: str, participant_name: str, days: int) -> list[dict[str, Any]]:
     return []
+
+
+def snapshot_needs_realtime_seed(payload: dict[str, Any], trade_date: str) -> bool:
+    freshness = payload.get("freshness")
+    source_dates = freshness.get("source_dates") if isinstance(freshness, dict) else {}
+    degraded_reasons = freshness.get("degraded_reasons") if isinstance(freshness, dict) else []
+    minute_bars = payload.get("minute_bars")
+    if isinstance(degraded_reasons, list) and "intraday_gap_before_attach" in degraded_reasons:
+        return True
+    if not isinstance(minute_bars, list) or not minute_bars:
+        return True
+    return not isinstance(source_dates, dict) or source_dates.get("minute_bars") != trade_date

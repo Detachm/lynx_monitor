@@ -38,13 +38,18 @@ class GatewayV2WebSocketService:
         port: int = 9020,
         path: str = "/ws",
         shadow_recorder: Any | None = None,
+        send_timeout_seconds: float = 2.0,
     ) -> None:
+        if send_timeout_seconds <= 0:
+            raise ValueError("send_timeout_seconds must be positive")
         self.manager = manager
         self.host = host
         self.port = port
         self.path = path
         self.shadow_recorder = shadow_recorder
+        self.send_timeout_seconds = send_timeout_seconds
         self.clients: dict[str, WebSocketConnection] = {}
+        self.failed_client_sends = 0
         self.terminal_messages_delivered = 0
         self.delivered_terminal_symbols: set[str] = set()
         self.last_terminal_message_delivered_at: str | None = None
@@ -64,24 +69,28 @@ class GatewayV2WebSocketService:
         self.clients[resolved_client_id] = websocket
         self.manager.connect(resolved_client_id)
         try:
-            await self.flush_client(resolved_client_id)
+            if await self.flush_client(resolved_client_id) < 0:
+                return
             async for raw_message in websocket:
                 try:
                     await asyncio.to_thread(self.manager.handle_message, resolved_client_id, raw_message)
                     self._record_performance_samples()
                 except Exception as error:
-                    await websocket.send(gateway_error(str(error)))
-                await self.flush_client(resolved_client_id)
+                    if not await self._send(resolved_client_id, gateway_error(str(error))):
+                        return
+                if await self.flush_client(resolved_client_id) < 0:
+                    return
         finally:
             self.manager.disconnect(resolved_client_id)
             self.clients.pop(resolved_client_id, None)
 
     async def broadcast_once(self) -> int:
         self.manager.broadcast_processed()
-        delivered = 0
-        for client_id in list(self.clients):
-            delivered += await self.flush_client(client_id)
-        return delivered
+        results = await asyncio.gather(
+            *(self.flush_client(client_id) for client_id in list(self.clients)),
+            return_exceptions=True,
+        )
+        return sum(result for result in results if isinstance(result, int) and result > 0)
 
     async def flush_client(self, client_id: str) -> int:
         websocket = self.clients.get(client_id)
@@ -90,13 +99,27 @@ class GatewayV2WebSocketService:
 
         messages = self.manager.flush(client_id)
         for message in messages:
-            await websocket.send(message)
+            if not await self._send(client_id, message):
+                return -1
             symbol = terminal_message_symbol(message)
             if symbol:
                 self.terminal_messages_delivered += 1
                 self.delivered_terminal_symbols.add(symbol)
                 self.last_terminal_message_delivered_at = now_iso()
         return len(messages)
+
+    async def _send(self, client_id: str, message: str) -> bool:
+        websocket = self.clients.get(client_id)
+        if websocket is None:
+            return False
+        try:
+            await asyncio.wait_for(websocket.send(message), timeout=self.send_timeout_seconds)
+            return True
+        except Exception:
+            self.failed_client_sends += 1
+            self.manager.disconnect(client_id)
+            self.clients.pop(client_id, None)
+            return False
 
     async def broadcast_loop(self, *, interval_seconds: float = 0.25, stop: asyncio.Event | None = None) -> None:
         stop_event = stop or asyncio.Event()

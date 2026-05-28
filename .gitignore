@@ -13,5 +13,6 @@ coverage/
 
 # Runtime artifacts
 artifacts/
+infra/production.env
 *.log
 .DS_Store

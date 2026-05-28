@@ -1,0 +1,29 @@
+FROM python:3.12-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app/backend \
+    TZ=Asia/Shanghai
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        bash \
+        ca-certificates \
+        curl \
+        libapr1 \
+        libaprutil1 \
+        procps \
+        tzdata \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY backend/requirements-production.txt /app/backend/requirements-production.txt
+RUN python -m pip install --no-cache-dir --upgrade pip \
+    && python -m pip install --no-cache-dir -r /app/backend/requirements-production.txt
+
+COPY backend /app/backend
+COPY infra/backend-entrypoint.sh /app/infra/backend-entrypoint.sh
+
+VOLUME ["/app/artifacts", "/data/silver", "/xtquant/sdk", "/xtquant/data"]
+
+ENTRYPOINT ["bash", "/app/infra/backend-entrypoint.sh"]

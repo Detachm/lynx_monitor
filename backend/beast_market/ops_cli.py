@@ -17,12 +17,14 @@ from .cutover import (
 )
 from .app_runtime import write_runtime_config_verification
 from .ops import (
+    explain_active_pool_symbol,
     build_multi_trader_smoke_observation,
     build_multi_trader_smoke_workflows_template,
     clear_runtime_cache,
     clear_runtime_state,
     finalize_multi_trader_smoke,
     finalize_shadow_run_cutover,
+    generate_active_pool,
     generate_required_historical_manifests,
     import_frontend_performance_samples,
     import_legacy_shadow_telemetry,
@@ -30,9 +32,12 @@ from .ops import (
     import_multi_trader_smoke_artifacts,
     inspect_multi_trader_smoke_readiness,
     package_multi_trader_smoke,
+    pin_active_pool_symbol,
     prepare_multi_trader_smoke,
     record_multi_trader_smoke_workflow,
     replay_kafka_spool,
+    unpin_active_pool_symbol,
+    validate_redis_read_model_coverage,
     verify_multi_trader_smoke_services,
 )
 from .production_adapters import KafkaEventBusAdapter
@@ -192,6 +197,72 @@ def main(argv: Sequence[str] | None = None) -> int:
                 sort_keys=True,
             )
         )
+        return 0 if result["passed"] else 1
+
+    if args.command == "generate-active-pool":
+        result = generate_active_pool(
+            silver_root=args.silver_root,
+            trade_date=args.trade_date,
+            target_size=args.target_size,
+            pinned_max_size=args.pinned_max_size,
+            rank_window_days=args.rank_window_days,
+            rank_metric=args.rank_metric,
+            exclude_instrument_types=parse_csv(args.exclude_instrument_types),
+            pinned_path=args.pinned_path or None,
+        )
+        print(json.dumps(result.snapshot, sort_keys=True))
+        return 0
+
+    if args.command == "explain-active-pool-symbol":
+        result = explain_active_pool_symbol(
+            silver_root=args.silver_root,
+            trade_date=args.trade_date,
+            symbol=args.symbol,
+            target_size=args.target_size,
+            pinned_max_size=args.pinned_max_size,
+            rank_window_days=args.rank_window_days,
+            rank_metric=args.rank_metric,
+            exclude_instrument_types=parse_csv(args.exclude_instrument_types),
+            pinned_path=args.pinned_path or None,
+        )
+        print(json.dumps(result.snapshot["explanation"], sort_keys=True))
+        return 0
+
+    if args.command in {"pin-active-symbol", "unpin-active-symbol"}:
+        operation = pin_active_pool_symbol if args.command == "pin-active-symbol" else unpin_active_pool_symbol
+        result = operation(
+            silver_root=args.silver_root,
+            trade_date=args.trade_date,
+            symbol=args.symbol,
+            pinned_path=args.pinned_path,
+            target_size=args.target_size,
+            pinned_max_size=args.pinned_max_size,
+            rank_window_days=args.rank_window_days,
+            rank_metric=args.rank_metric,
+            exclude_instrument_types=parse_csv(args.exclude_instrument_types),
+        )
+        print(
+            json.dumps(
+                {
+                    "operation": result.operation,
+                    "symbol": result.symbol,
+                    "change": result.change,
+                    "pinned_path": str(result.pinned_path),
+                    "snapshot": result.snapshot,
+                },
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if args.command == "validate-redis-read-model-coverage":
+        redis_client = build_redis_client(args.redis_url)
+        result = validate_redis_read_model_coverage(
+            redis_client=redis_client,
+            trade_date=args.trade_date,
+            symbols=parse_symbols(args.symbols),
+        )
+        print(json.dumps(result, sort_keys=True))
         return 0 if result["passed"] else 1
 
     if args.command == "clear-runtime-cache":
@@ -786,6 +857,45 @@ def build_parser() -> argparse.ArgumentParser:
     runtime_config.add_argument("--config-path", required=True)
     runtime_config.add_argument("--output-path", required=True)
 
+    active_pool = subparsers.add_parser(
+        "generate-active-pool",
+        help="Generate today's active symbol pool from silver daily bars.",
+    )
+    add_active_pool_arguments(active_pool)
+    active_pool.add_argument("--pinned-path", default="")
+
+    explain_pool = subparsers.add_parser(
+        "explain-active-pool-symbol",
+        help="Explain why one symbol is active, pinned, temporary, excluded, or below cutoff.",
+    )
+    add_active_pool_arguments(explain_pool)
+    explain_pool.add_argument("--symbol", required=True)
+    explain_pool.add_argument("--pinned-path", default="")
+
+    pin_pool = subparsers.add_parser(
+        "pin-active-symbol",
+        help="Manually add a symbol to the query-pinned active pool file.",
+    )
+    add_active_pool_arguments(pin_pool)
+    pin_pool.add_argument("--symbol", required=True)
+    pin_pool.add_argument("--pinned-path", required=True)
+
+    unpin_pool = subparsers.add_parser(
+        "unpin-active-symbol",
+        help="Manually remove a symbol from the query-pinned active pool file.",
+    )
+    add_active_pool_arguments(unpin_pool)
+    unpin_pool.add_argument("--symbol", required=True)
+    unpin_pool.add_argument("--pinned-path", required=True)
+
+    redis_coverage = subparsers.add_parser(
+        "validate-redis-read-model-coverage",
+        help="Validate Redis read-model keys for a date and symbol set.",
+    )
+    redis_coverage.add_argument("--redis-url", required=True)
+    redis_coverage.add_argument("--trade-date", required=True)
+    redis_coverage.add_argument("--symbols", required=True)
+
     runtime_cache = subparsers.add_parser(
         "clear-runtime-cache",
         help="Safely clear dashboard Redis runtime cache for explicit date and symbol scopes.",
@@ -995,6 +1105,20 @@ def build_parser() -> argparse.ArgumentParser:
 
 def parse_symbols(raw: str) -> list[str]:
     return [symbol.strip() for symbol in raw.split(",") if symbol.strip()]
+
+
+def parse_csv(raw: str) -> list[str]:
+    return [value.strip() for value in raw.split(",") if value.strip()]
+
+
+def add_active_pool_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--silver-root", required=True)
+    parser.add_argument("--trade-date", required=True)
+    parser.add_argument("--target-size", type=int, default=200)
+    parser.add_argument("--pinned-max-size", type=int, default=100)
+    parser.add_argument("--rank-window-days", type=int, default=5)
+    parser.add_argument("--rank-metric", choices=["avg_turnover", "avg_volume"], default="avg_turnover")
+    parser.add_argument("--exclude-instrument-types", default="ETF,WARRANT,CBBC,FUND,BOND,DERIVATIVE")
 
 
 def build_redis_client(redis_url: str):

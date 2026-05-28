@@ -92,15 +92,11 @@ export function selectDefaultDataSourceMode(
   cutoverReadiness: CutoverReadiness | null,
   validationErrors: string[] = [],
 ): DataSourceMode {
-  if (validationErrors.length > 0) {
-    return 'mock'
-  }
-
   if (configuredMode === 'auto') {
-    return isFrontendV2ReadinessAllowed(cutoverReadiness) ? 'live' : 'mock'
+    return 'live'
   }
 
-  return configuredMode
+  return configuredMode === 'mock' ? 'live' : configuredMode
 }
 
 function isFrontendV2ReadinessAllowed(cutoverReadiness: CutoverReadiness | null): boolean {
@@ -147,7 +143,7 @@ function isPositiveInteger(value: unknown): value is number {
 }
 
 function parseConfiguredMode(input: unknown): ConfiguredDataSourceMode {
-  return input === 'mock' || input === 'live' || input === 'auto' ? input : 'mock'
+  return input === 'mock' || input === 'live' || input === 'auto' ? input : 'live'
 }
 
 function parseLiveUrl(input: unknown): string {
@@ -218,22 +214,22 @@ function isGatewayWebSocketUrl(value: string): boolean {
     return (
       (parsed.protocol === 'ws:' || parsed.protocol === 'wss:') &&
       parsed.pathname === '/ws' &&
-      hasExplicitPort(value)
+      hasExplicitOrDefaultPort(value, parsed.protocol)
     )
   } catch {
     return false
   }
 }
 
-function hasExplicitPort(value: string): boolean {
+function hasExplicitOrDefaultPort(value: string, protocol: string): boolean {
   const authority = value.match(/^[a-z][a-z\d+.-]*:\/\/([^/?#]*)/i)?.[1]
   if (!authority) {
     return false
   }
   if (authority.startsWith('[')) {
-    return /\]:\d+$/.test(authority)
+    return /\]:\d+$/.test(authority) || protocol === 'wss:' || protocol === 'ws:'
   }
-  return /:\d+$/.test(authority)
+  return /:\d+$/.test(authority) || protocol === 'wss:' || protocol === 'ws:'
 }
 
 function parseCutoverReadiness(input: unknown): CutoverReadiness | null {

@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+import re
 from typing import Any
 
 from .adapters import EventBus, SnapshotCache, validate_event_bus_record_inputs
@@ -18,6 +19,8 @@ from .contracts import (
 )
 from .freshness import FreshnessPolicy, SymbolFreshnessTracker
 from .mammoth_api import MammothAPI
+
+HK_TZ = timezone(timedelta(hours=8))
 
 
 @dataclass
@@ -208,11 +211,13 @@ class OctopusComputeV2:
         cache: SnapshotCache,
         *,
         big_trade_volume_baseline_ratio: float = 0.0005,
+        hydrate_historical_alerts: bool = False,
     ) -> None:
         self.mammoth = mammoth
         self.bus = bus
         self.cache = cache
         self.big_trade_volume_baseline_ratio = big_trade_volume_baseline_ratio
+        self.hydrate_historical_alerts = hydrate_historical_alerts
         self.seq_by_symbol: dict[str, int] = defaultdict(int)
         self.state_by_symbol: dict[str, dict[str, Any]] = {}
         self.bod_by_symbol: dict[str, BodState] = {}
@@ -260,10 +265,21 @@ class OctopusComputeV2:
         initial_price = float(latest_minute_bar["price"]) if latest_minute_bar else previous_close
         initial_volume = sum(int(bar.get("volume") or 0) for bar in minute_bars)
         initial_turnover = sum(float(bar.get("turnover") or 0) for bar in minute_bars)
+        alerts, latest_tick_ts = (
+            self._historical_big_trade_alerts(symbol, trade_date)
+            if self.hydrate_historical_alerts
+            else ([], "")
+        )
+        instrument_name = ""
+        get_instrument_name = getattr(self.mammoth, "get_instrument_name", None)
+        try:
+            instrument_name = get_instrument_name(symbol) if callable(get_instrument_name) else ""
+        except Exception:
+            instrument_name = ""
         snapshot = {
             "snapshot": {
                 "symbol": symbol,
-                "name": symbol,
+                "name": instrument_name or symbol,
                 "currency": "HKD",
                 "tradeDate": trade_date,
                 "requestedTradeDate": requested_date,
@@ -281,7 +297,7 @@ class OctopusComputeV2:
                 "nextSessionPreviousClose": float(current_daily_bar["close"]) if current_daily_bar else initial_price,
             },
             "minute_bars": minute_bars,
-            "alerts": [],
+            "alerts": alerts,
             "broker_queue": broker_queue,
             "l2_order_book": empty_l2_order_book(),
             "ccass_holdings": holdings,
@@ -300,13 +316,60 @@ class OctopusComputeV2:
                     "daily_bars": str(current_daily_bar["trade_date"]) if current_daily_bar else "",
                     "ccass_current": ccass_pair["current_date"],
                     "ccass_previous": ccass_pair["previous_date"],
+                    "trade_ticks": trade_date if latest_tick_ts else "",
                 },
                 "degraded_reasons": [] if minute_bars else ["missing_minute_bars"],
             },
         }
+        if latest_tick_ts:
+            snapshot["freshness"]["source_ts"] = latest_tick_ts
         self.state_by_symbol[symbol] = snapshot
         self._cache_set_terminal_snapshot(cache_date, symbol, snapshot)
         return snapshot
+
+    def _historical_big_trade_alerts(self, symbol: str, trade_date: str) -> tuple[list[dict[str, Any]], str]:
+        bod = self.bod_by_symbol.get(symbol)
+        if bod is None:
+            return [], ""
+        try:
+            rows = self.mammoth.get_trade_ticks(symbol, trade_date)
+        except Exception:
+            return [], ""
+
+        alerts: list[dict[str, Any]] = []
+        latest_tick_ts = ""
+        rows.sort(key=lambda row: str(row.get("tick_ts") or ""))
+        for index, row in enumerate(rows, start=1):
+            tick_ts = str(row.get("tick_ts") or "")
+            if tick_ts:
+                latest_tick_ts = tick_ts
+            tick = {
+                "timestamp": tick_ts,
+                "price": float(row.get("price") or 0),
+                "volume": int(float(row.get("volume") or 0)),
+                "turnover": float(row.get("turnover") or 0),
+                "direction": "flat",
+            }
+            if not is_big_trade(tick, bod, self.big_trade_volume_baseline_ratio):
+                continue
+            payload = {
+                "side": row.get("side"),
+                "broker_code": row.get("broker_code"),
+                "broker_name": row.get("broker_name"),
+                "participant_id": row.get("participant_id"),
+                "participant_name": row.get("participant_name"),
+                "trade_type": row.get("trade_type"),
+            }
+            raw_event = {
+                "event_id": (
+                    f"historical-alert-{symbol}-{safe_alert_id_part(tick_ts)}-"
+                    f"{safe_alert_id_part(str(row.get('trade_id') or row.get('row_hash') or index))}"
+                ),
+                "payload": payload,
+            }
+            alerts.append(make_big_trade_alert(raw_event, tick, bod))
+        alerts.sort(key=lambda alert: str(alert.get("timestamp") or ""), reverse=True)
+        return alerts[:500], latest_tick_ts
 
     def ensure_bod_context(
         self,
@@ -471,6 +534,7 @@ class OctopusComputeV2:
             "turnover": float(payload["turnover"]),
             "direction": "flat",
         }
+        is_full_tick_seed = raw_event.get("period") == "full_tick" or raw_event.get("source") == "xtquant_full_tick"
         rollover = snapshot_trade_date(state) != trade_date
         if rollover:
             rollover_previous_close = float(
@@ -500,14 +564,15 @@ class OctopusComputeV2:
             "price": tick["price"],
             "high": max(float(state["snapshot"].get("high") or tick["price"]), tick["price"]),
             "low": min(float(state["snapshot"].get("low") or tick["price"]), tick["price"]),
-            "volume": int(state["snapshot"]["volume"]) + tick["volume"],
-            "turnover": float(state["snapshot"]["turnover"]) + tick["turnover"],
+            "volume": tick["volume"] if is_full_tick_seed else int(state["snapshot"]["volume"]) + tick["volume"],
+            "turnover": tick["turnover"] if is_full_tick_seed else float(state["snapshot"]["turnover"]) + tick["turnover"],
             "change": tick["price"] - float(state["snapshot"]["previousClose"]),
             "updatedAt": raw_event["ingest_ts"],
         }
         previous_close = float(state["snapshot"]["previousClose"])
         state["snapshot"]["changePercent"] = 0.0 if previous_close == 0 else state["snapshot"]["change"] / previous_close * 100
-        state["minute_bars"] = upsert_minute_bar(state["minute_bars"], tick)
+        minute_tick = {**tick, "volume": 0, "turnover": 0.0} if is_full_tick_seed else tick
+        state["minute_bars"] = upsert_minute_bar(state["minute_bars"], minute_tick)
         state["last_tick"] = tick
         state["freshness"] = realtime_freshness(state, raw_event, trade_date)
 
@@ -619,6 +684,7 @@ class OctopusComputeV2:
         raw_event: dict[str, Any],
         trade_date: str,
     ) -> BrokerQueueStateUpdate:
+        rollover_realtime_session(state, trade_date, raw_event["ingest_ts"])
         broker_queue = normalize_raw_broker_queue(raw_event["payload"], self.bod_by_symbol.get(raw_event["symbol"]))
         state["broker_queue"] = merge_broker_queue(state["broker_queue"], broker_queue)
         state["freshness"] = realtime_freshness(state, raw_event, trade_date)
@@ -630,6 +696,7 @@ class OctopusComputeV2:
         raw_event: dict[str, Any],
         trade_date: str,
     ) -> L2OrderBookStateUpdate:
+        rollover_realtime_session(state, trade_date, raw_event["ingest_ts"])
         order_book = normalize_l2_order_book(raw_event["payload"])
         state["l2_order_book"] = order_book
         state["freshness"] = realtime_freshness(state, raw_event, trade_date)
@@ -931,6 +998,10 @@ def normalize_trade_side(value: Any) -> str:
     return "neutral"
 
 
+def safe_alert_id_part(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "-", value).strip("-") or "unknown"
+
+
 def upsert_minute_bar(minute_bars: list[dict[str, Any]], tick: dict[str, Any]) -> list[dict[str, Any]]:
     minute_ts = minute_bucket(tick["timestamp"])
     for index, previous in enumerate(minute_bars):
@@ -951,14 +1022,26 @@ def upsert_minute_bar(minute_bars: list[dict[str, Any]], tick: dict[str, Any]) -
         updated.sort(key=lambda bar: minute_bucket(str(bar["timestamp"])))
         return updated[-420:]
 
-    updated = [*minute_bars, {**tick, "timestamp": minute_ts}]
+    updated = [
+        *minute_bars,
+        {
+            **tick,
+            "timestamp": minute_ts,
+            "open": tick["price"],
+            "high": tick["price"],
+            "low": tick["price"],
+            "close": tick["price"],
+        },
+    ]
     updated.sort(key=lambda bar: minute_bucket(str(bar["timestamp"])))
     return updated[-420:]
 
 
 def minute_bucket(timestamp: str) -> str:
     parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
-    return parsed.replace(second=0, microsecond=0).isoformat()
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=HK_TZ)
+    return parsed.astimezone(HK_TZ).replace(second=0, microsecond=0).isoformat()
 
 
 def normalize_raw_broker_queue(payload: dict[str, Any], bod: BodState | None = None) -> dict[str, list[dict[str, Any]]]:
@@ -1030,6 +1113,51 @@ def realtime_freshness(state: dict[str, Any], raw_event: dict[str, Any], trade_d
         "source_dates": source_dates,
         "degraded": False,
         "degraded_reasons": [],
+    }
+
+
+def rollover_realtime_session(state: dict[str, Any], trade_date: str, updated_at: str) -> None:
+    if snapshot_trade_date(state) == trade_date:
+        return
+    snapshot = state.get("snapshot") if isinstance(state.get("snapshot"), dict) else {}
+    reference_price = float(
+        snapshot.get("nextSessionPreviousClose")
+        or snapshot.get("price")
+        or snapshot.get("previousClose")
+        or 0
+    )
+    state["minute_bars"] = []
+    state["alerts"] = []
+    state["snapshot"] = {
+        **snapshot,
+        "tradeDate": trade_date,
+        "requestedTradeDate": trade_date,
+        "isHistoricalSession": False,
+        "price": reference_price,
+        "previousClose": reference_price,
+        "open": reference_price,
+        "high": reference_price,
+        "low": reference_price,
+        "volume": 0,
+        "turnover": 0.0,
+        "change": 0.0,
+        "changePercent": 0.0,
+        "updatedAt": updated_at,
+    }
+    freshness = state.get("freshness") if isinstance(state.get("freshness"), dict) else {}
+    source_dates = freshness.get("source_dates") if isinstance(freshness.get("source_dates"), dict) else {}
+    state["freshness"] = {
+        **freshness,
+        "updated_at": updated_at,
+        "requested_trade_date": trade_date,
+        "effective_trade_date": trade_date,
+        "source_dates": {
+            **source_dates,
+            "minute_bars": "",
+            "trade_ticks": "",
+            "broker_queue": "",
+            "realtime_session": trade_date,
+        },
     }
 
 

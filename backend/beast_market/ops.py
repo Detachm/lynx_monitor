@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from .active_pool import ActivePoolConfig, ActiveSymbolPoolManager, DEFAULT_EXCLUDE_INSTRUMENT_TYPES
 from .adapters import EventBus, FileBackedSpool, validate_snapshot_key_inputs
 from .contracts import REDIS_RUNTIME_SNAPSHOT_KEY_TEMPLATES
 from .cutover import (
@@ -91,6 +92,15 @@ class RuntimeCacheClearResult:
     confirmed: bool
     keys: list[str]
     deleted_keys: list[str]
+
+
+@dataclass(frozen=True)
+class ActivePoolOperationResult:
+    operation: str
+    snapshot: dict[str, Any]
+    symbol: str = ""
+    change: dict[str, Any] | None = None
+    pinned_path: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -276,6 +286,223 @@ def runtime_cache_keys(
         elif include_unmatched_history_pattern:
             keys.append(history_pattern)
     return sorted(dict.fromkeys(keys))
+
+
+def generate_active_pool(
+    *,
+    silver_root: str | Path,
+    trade_date: str,
+    target_size: int = 200,
+    pinned_max_size: int = 100,
+    rank_window_days: int = 5,
+    rank_metric: str = "avg_turnover",
+    exclude_instrument_types: list[str] | None = None,
+    pinned_path: str | Path | None = None,
+) -> ActivePoolOperationResult:
+    manager = build_active_pool_manager(
+        silver_root=silver_root,
+        trade_date=trade_date,
+        target_size=target_size,
+        pinned_max_size=pinned_max_size,
+        rank_window_days=rank_window_days,
+        rank_metric=rank_metric,
+        exclude_instrument_types=exclude_instrument_types,
+        pinned_path=pinned_path,
+    )
+    manager.rebuild_base_active()
+    return ActivePoolOperationResult(operation="generate", snapshot=manager.snapshot(), pinned_path=Path(pinned_path) if pinned_path else None)
+
+
+def explain_active_pool_symbol(
+    *,
+    silver_root: str | Path,
+    trade_date: str,
+    symbol: str,
+    target_size: int = 200,
+    pinned_max_size: int = 100,
+    rank_window_days: int = 5,
+    rank_metric: str = "avg_turnover",
+    exclude_instrument_types: list[str] | None = None,
+    pinned_path: str | Path | None = None,
+) -> ActivePoolOperationResult:
+    manager = build_active_pool_manager(
+        silver_root=silver_root,
+        trade_date=trade_date,
+        target_size=target_size,
+        pinned_max_size=pinned_max_size,
+        rank_window_days=rank_window_days,
+        rank_metric=rank_metric,
+        exclude_instrument_types=exclude_instrument_types,
+        pinned_path=pinned_path,
+    )
+    manager.rebuild_base_active()
+    explanation = manager.explain(symbol)
+    return ActivePoolOperationResult(
+        operation="explain",
+        snapshot={**manager.snapshot(), "explanation": explanation},
+        symbol=explanation["symbol"],
+        pinned_path=Path(pinned_path) if pinned_path else None,
+    )
+
+
+def pin_active_pool_symbol(
+    *,
+    silver_root: str | Path,
+    trade_date: str,
+    symbol: str,
+    pinned_path: str | Path,
+    target_size: int = 200,
+    pinned_max_size: int = 100,
+    rank_window_days: int = 5,
+    rank_metric: str = "avg_turnover",
+    exclude_instrument_types: list[str] | None = None,
+) -> ActivePoolOperationResult:
+    manager = build_active_pool_manager(
+        silver_root=silver_root,
+        trade_date=trade_date,
+        target_size=target_size,
+        pinned_max_size=pinned_max_size,
+        rank_window_days=rank_window_days,
+        rank_metric=rank_metric,
+        exclude_instrument_types=exclude_instrument_types,
+        pinned_path=pinned_path,
+    )
+    manager.rebuild_base_active()
+    change = manager.manual_pin(symbol)
+    write_pinned_symbols(pinned_path, manager.query_pinned)
+    return ActivePoolOperationResult(
+        operation="pin",
+        snapshot=manager.snapshot(),
+        symbol=change.symbol,
+        change=change.__dict__,
+        pinned_path=Path(pinned_path),
+    )
+
+
+def unpin_active_pool_symbol(
+    *,
+    silver_root: str | Path,
+    trade_date: str,
+    symbol: str,
+    pinned_path: str | Path,
+    target_size: int = 200,
+    pinned_max_size: int = 100,
+    rank_window_days: int = 5,
+    rank_metric: str = "avg_turnover",
+    exclude_instrument_types: list[str] | None = None,
+) -> ActivePoolOperationResult:
+    manager = build_active_pool_manager(
+        silver_root=silver_root,
+        trade_date=trade_date,
+        target_size=target_size,
+        pinned_max_size=pinned_max_size,
+        rank_window_days=rank_window_days,
+        rank_metric=rank_metric,
+        exclude_instrument_types=exclude_instrument_types,
+        pinned_path=pinned_path,
+    )
+    manager.rebuild_base_active()
+    change = manager.manual_unpin(symbol)
+    write_pinned_symbols(pinned_path, manager.query_pinned)
+    return ActivePoolOperationResult(
+        operation="unpin",
+        snapshot=manager.snapshot(),
+        symbol=change.symbol,
+        change=change.__dict__,
+        pinned_path=Path(pinned_path),
+    )
+
+
+def validate_redis_read_model_coverage(
+    *,
+    redis_client: Any,
+    trade_date: str,
+    symbols: list[str],
+) -> dict[str, Any]:
+    checked_symbols = sorted(dict.fromkeys(symbols))
+    coverage: dict[str, Any] = {}
+    missing_symbols: set[str] = set()
+    for family in ("terminal_snapshot", "terminal_minute", "terminal_alerts", "terminal_queue", "terminal_state"):
+        template = REDIS_RUNTIME_SNAPSHOT_KEY_TEMPLATES[family]
+        present = []
+        missing = []
+        for symbol in checked_symbols:
+            key = template.format(trade_date=trade_date, symbol=symbol)
+            if redis_key_exists(redis_client, key):
+                present.append(symbol)
+            else:
+                missing.append(symbol)
+                missing_symbols.add(symbol)
+        coverage[family] = {"present_symbols": present, "missing_symbols": missing}
+    return {
+        "schema_version": 1,
+        "trade_date": trade_date,
+        "checked_symbols": checked_symbols,
+        "passed": not missing_symbols,
+        "missing_symbols": sorted(missing_symbols),
+        "key_family_coverage": coverage,
+    }
+
+
+def build_active_pool_manager(
+    *,
+    silver_root: str | Path,
+    trade_date: str,
+    target_size: int,
+    pinned_max_size: int,
+    rank_window_days: int,
+    rank_metric: str,
+    exclude_instrument_types: list[str] | None = None,
+    pinned_path: str | Path | None = None,
+) -> ActiveSymbolPoolManager:
+    return ActiveSymbolPoolManager(
+        MammothAPI(silver_root),
+        trade_date=trade_date,
+        config=ActivePoolConfig(
+            target_size=target_size,
+            pinned_max_size=pinned_max_size,
+            rank_window_days=rank_window_days,
+            rank_metric=rank_metric,
+            exclude_instrument_types=tuple(exclude_instrument_types or DEFAULT_EXCLUDE_INSTRUMENT_TYPES),
+        ),
+        query_pinned=read_pinned_symbols(pinned_path) if pinned_path else [],
+    )
+
+
+def read_pinned_symbols(path: str | Path | None) -> list[str]:
+    if path is None:
+        return []
+    pinned_path = Path(path)
+    if not pinned_path.exists():
+        return []
+    decoded = json.loads(pinned_path.read_text(encoding="utf-8"))
+    if isinstance(decoded, dict):
+        symbols = decoded.get("query_pinned") or decoded.get("symbols") or []
+    else:
+        symbols = decoded
+    if not isinstance(symbols, list):
+        raise ValueError("pinned symbols file must contain a list or an object with query_pinned")
+    return [str(symbol) for symbol in symbols]
+
+
+def write_pinned_symbols(path: str | Path, symbols: list[str]) -> None:
+    pinned_path = Path(path)
+    pinned_path.parent.mkdir(parents=True, exist_ok=True)
+    pinned_path.write_text(
+        json.dumps({"schema_version": 1, "query_pinned": symbols}, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def redis_key_exists(redis_client: Any, key: str) -> bool:
+    exists = getattr(redis_client, "exists", None)
+    if callable(exists):
+        return bool(exists(key))
+    values = getattr(redis_client, "values", None)
+    if isinstance(values, dict):
+        return key in values
+    get = getattr(redis_client, "get", None)
+    return bool(callable(get) and get(key) is not None)
 
 
 def clear_runtime_state(

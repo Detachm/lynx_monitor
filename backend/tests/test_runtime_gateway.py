@@ -20,8 +20,10 @@ from beast_market import (
     RealtimeIngestWorker,
     ReliableEventBus,
     SymbolRuntimeManager,
+    SymbolRuntimeState,
     HistoricalHydrationService,
     HydrationKey,
+    XtQuantMarketDataClient,
     make_processed_market_event,
     XtQuantSubscriptionManager,
     make_raw_market_event,
@@ -66,6 +68,8 @@ class RuntimeGatewayTest(unittest.TestCase):
 
         self.assertEqual(worker.stats.rejected, 1)
         self.assertEqual(rejected_callbacks, [({"code": "700", "price": 388.5, "volume": 1000}, "raw_callback_queue_full")])
+        self.assertEqual(len(worker.stats.callback_enqueue_latency_ms), 2)
+        self.assertGreaterEqual(worker.stats.callback_enqueue_max_latency_ms, worker.stats.callback_enqueue_last_latency_ms)
 
     def test_realtime_ingest_worker_marks_kafka_publish_failure_without_misclassifying_payload(self) -> None:
         spool = LocalSpool()
@@ -149,6 +153,99 @@ class RuntimeGatewayTest(unittest.TestCase):
         self.assertEqual(events[1]["payload"]["entries"][0]["broker_code"], "UBS")
         self.assertEqual(events[2]["payload"]["ask"][0]["price"], 388.6)
 
+    def test_realtime_ingest_worker_accepts_brokerqueue2_callbacks(self) -> None:
+        bus = InMemoryEventBus()
+        worker = RealtimeIngestWorker(
+            BoundedRawEventQueue(max_size=10),
+            RealtimeCollectorV2(bus),
+            normalizer=normalize_xtquant_callback,
+        )
+
+        self.assertTrue(
+            worker.receive_callback(
+                {
+                    "symbol": "00700.HK",
+                    "period": "brokerqueue2",
+                    "data": {
+                        "Time": 1779413401000,
+                        "AskQueues": [{"Price": 388.6, "Brokers": ["JPM"], "Volumes": [3000]}],
+                    },
+                }
+            )
+        )
+
+        events = worker.drain_all()
+
+        self.assertEqual(events[0]["kind"], "broker_queue")
+        self.assertEqual(events[0]["period"], "brokerqueue2")
+        self.assertEqual(events[0]["payload"]["entries"][0]["side"], "ask")
+        self.assertGreaterEqual(worker.stats.callback_enqueue_last_latency_ms, 0.0)
+
+    def test_xtquant_market_data_client_wraps_callbacks_without_processing(self) -> None:
+        xtdata = FakeXtData()
+        received: list[dict] = []
+        client = XtQuantMarketDataClient(
+            xtdata_module=xtdata,
+            xtdatacenter_module=FakeXtDataCenter(),
+            callback_sink=lambda payload: received.append(payload),
+            periods=("hktransaction", "brokerqueue2"),
+            sdk_path="/opt/xtquant",
+        )
+
+        client.start()
+        client.subscribe("700")
+        xtdata.callbacks[("00700.HK", "hktransaction")]({"Price": 388.4, "Volume": 1000})
+        xtdata.callbacks[("00700.HK", "brokerqueue2")]({"00700.HK": [{"BidQueues": [{"Price": 388.2, "Brokers": ["UBS"], "Volumes": [2000]}]}]})
+        client.unsubscribe("00700.HK")
+        client.stop()
+
+        self.assertEqual(xtdata.calls[0], ("connect", "127.0.0.1", 58628))
+        self.assertIn(("subscribe_quote", "00700.HK", "hktransaction"), xtdata.calls)
+        self.assertIn(("subscribe_quote", "00700.HK", "brokerqueue2"), xtdata.calls)
+        self.assertEqual([payload["period"] for payload in received], ["hktransaction", "brokerqueue2"])
+        self.assertEqual(received[0]["data"], {"Price": 388.4, "Volume": 1000})
+        self.assertEqual(received[1]["data"]["BidQueues"][0]["Brokers"], ["UBS"])
+        self.assertEqual(client.stats.callbacks_received, 2)
+        self.assertEqual(client.stats.callbacks_enqueued, 2)
+        self.assertEqual(client.stats_snapshot()["subscription_count"], 0)
+        self.assertEqual(client.stats_snapshot()["sdk_path"], "/opt/xtquant")
+
+    def test_xtquant_market_data_client_reuses_existing_datacenter_port(self) -> None:
+        xtdata = FakeXtData()
+        datacenter = FakeXtDataCenter(listen_error=OSError("监听端口失败: 58628, 请检查端口是否被占用"))
+        client = XtQuantMarketDataClient(
+            xtdata_module=xtdata,
+            xtdatacenter_module=datacenter,
+            callback_sink=lambda payload: None,
+        )
+
+        client.start()
+
+        self.assertTrue(client.running)
+        self.assertEqual(xtdata.calls[0], ("connect", "127.0.0.1", 58628))
+        self.assertEqual(datacenter.listen_calls, [58628])
+
+    def test_xtquant_market_data_client_retries_next_port_when_connect_fails(self) -> None:
+        xtdata = FakeXtData(connect_failures_by_port={58628: RuntimeError("无法连接xtquant服务")})
+        datacenter = FakeXtDataCenter()
+        client = XtQuantMarketDataClient(
+            xtdata_module=xtdata,
+            xtdatacenter_module=datacenter,
+            callback_sink=lambda payload: None,
+            connect_retries=1,
+            port_retry_count=2,
+        )
+
+        client.start()
+
+        self.assertTrue(client.running)
+        self.assertEqual(client.port, 58629)
+        self.assertEqual(
+            [call for call in xtdata.calls if call[0] == "connect"],
+            [("connect", "127.0.0.1", 58628), ("connect", "127.0.0.1", 58629)],
+        )
+        self.assertEqual(datacenter.listen_calls, [58628, 58629])
+
     def test_collector_freshness_tracks_backlog_stale_symbols_and_resubscribe_requests(self) -> None:
         bus = InMemoryEventBus()
         collector = RealtimeCollectorV2(
@@ -163,11 +260,13 @@ class RuntimeGatewayTest(unittest.TestCase):
 
         collector.subscribe_symbol("00700.HK")
         initial = collector.evaluate_freshness(now="2026-05-22T09:30:00+08:00")
-        self.assertEqual(initial["resubscribe_symbols"], ["00700.HK"])
-        self.assertEqual(
-            collector.health.symbol_freshness["00700.HK"]["degraded_reason"],
-            "no_events_after_subscribe",
-        )
+        self.assertEqual(initial["resubscribe_symbols"], [])
+        self.assertFalse(collector.health.symbol_freshness["00700.HK"]["degraded"])
+
+        collector.freshness.state_by_symbol["00700.HK"].subscribed_at = "2026-05-22T09:30:00+08:00"
+        no_event = collector.evaluate_freshness(now="2026-05-22T09:30:31+08:00")
+        self.assertEqual(no_event["resubscribe_symbols"], ["00700.HK"])
+        self.assertEqual(collector.health.symbol_freshness["00700.HK"]["degraded_reason"], "no_events_after_subscribe")
 
         worker.receive_callback(
             {"code": "700", "price": 388.4, "volume": 1000, "timestamp": "2026-05-22T09:30:00+08:00"}
@@ -226,6 +325,44 @@ class RuntimeGatewayTest(unittest.TestCase):
         )
         self.assertEqual(manager.stats.resubscribes, 1)
         self.assertFalse(manager.running)
+
+    def test_subscription_manager_does_not_resubscribe_when_callback_queue_is_full(self) -> None:
+        client = FakeMarketDataClient()
+        collector = RealtimeCollectorV2(
+            InMemoryEventBus(),
+            freshness_policy=FreshnessPolicy(max_event_age_seconds=30, max_queue_backlog=1),
+        )
+        manager = XtQuantSubscriptionManager(client, collector)
+
+        manager.start()
+        manager.subscribe("00700.HK")
+        collector.record_queue_backlog("00700.HK", 10, period="hktransaction", stream_kind="tick")
+        result = manager.check_freshness_and_resubscribe(now="2026-05-22T09:31:00+08:00")
+
+        self.assertEqual(result["resubscribe_symbols"], ["00700.HK"])
+        self.assertEqual(manager.stats.resubscribes, 0)
+        self.assertEqual(client.calls, [("start", ""), ("subscribe", "00700.HK")])
+
+    def test_subscription_manager_throttles_repeated_resubscribe_requests(self) -> None:
+        client = FakeMarketDataClient()
+        collector = RealtimeCollectorV2(
+            InMemoryEventBus(),
+            freshness_policy=FreshnessPolicy(max_event_age_seconds=0.01, max_queue_backlog=100),
+        )
+        manager = XtQuantSubscriptionManager(client, collector, resubscribe_cooldown_seconds=60)
+
+        manager.start()
+        manager.subscribe("00700.HK")
+        collector.ingest_tick(
+            "00700.HK",
+            {"timestamp": "2026-05-22T09:30:00+08:00", "price": 388.4, "volume": 1000},
+        )
+        first = manager.check_freshness_and_resubscribe(now="2026-05-22T09:31:00+08:00")
+        second = manager.check_freshness_and_resubscribe(now="2026-05-22T09:31:01+08:00")
+
+        self.assertEqual(first["resubscribe_symbols"], ["00700.HK"])
+        self.assertEqual(second["resubscribe_symbols"], ["00700.HK"])
+        self.assertEqual(manager.stats.resubscribes, 1)
 
     def test_xtquant_subscription_manager_marks_collector_degraded_on_client_failure(self) -> None:
         client = FakeMarketDataClient(fail_on="subscribe")
@@ -591,6 +728,68 @@ class RuntimeGatewayTest(unittest.TestCase):
         self.assertEqual(manager.snapshot()["00700.HK"]["delta_emitted"], 1)
         self.assertEqual(manager.manager_snapshot()["runtime_delta_emitted"], 1)
 
+    def test_symbol_runtime_raw_event_hydrates_missing_snapshot_before_processing(self) -> None:
+        payload = snapshot_payload()
+
+        def process_raw(raw_event: dict, trade_date: str, state: dict) -> list[dict]:
+            state["snapshot"] = {"symbol": raw_event["symbol"], "price": raw_event["payload"]["price"]}
+            state["last_tick"] = {
+                "timestamp": raw_event["source_ts"],
+                "price": raw_event["payload"]["price"],
+                "volume": raw_event["payload"]["volume"],
+                "turnover": raw_event["payload"]["turnover"],
+            }
+            state["freshness"] = {"updated_at": raw_event["source_ts"], "runtime_state": "LIVE"}
+            return [
+                make_processed_market_event(
+                    result_type="snapshot",
+                    symbol=raw_event["symbol"],
+                    source="symbol-runtime-test",
+                    seq=1,
+                    source_ts=raw_event["source_ts"],
+                    payload=state,
+                )
+            ]
+
+        manager = SymbolRuntimeManager(
+            FakeSymbolGateway(),
+            trade_date="20260522",
+            hydrate_symbol=lambda symbol: payload,
+            raw_event_processor=process_raw,
+        )
+        raw_event = make_raw_market_event(
+            kind="tick",
+            symbol="00700.HK",
+            source="xtquant",
+            seq=1,
+            source_ts="2026-05-22T09:31:00+08:00",
+            payload={"price": 389.0, "volume": 100, "turnover": 38900},
+        )
+
+        processed, terminal_messages = manager.apply_raw_event(raw_event, "20260522")
+
+        self.assertEqual(len(processed), 1)
+        self.assertEqual(terminal_messages[0]["type"], "tick_realtime")
+        self.assertEqual(manager.runtimes["00700.HK"].hydrate_count, 1)
+
+    def test_retain_existing_runtime_revives_evicting_runtime_for_new_subscriber(self) -> None:
+        manager = SymbolRuntimeManager(
+            FakeSymbolGateway(),
+            trade_date="20260522",
+            hydrate_symbol=lambda symbol: snapshot_payload(),
+        )
+        manager.attach("00700.HK", "client-1")
+        manager.runtimes["00700.HK"].realtime_attached = True
+        manager.detach("00700.HK", "client-1")
+
+        retained = manager.retain_existing_runtime("00700.HK", "client-2")
+
+        self.assertTrue(retained)
+        runtime = manager.runtimes["00700.HK"]
+        self.assertEqual(runtime.state, SymbolRuntimeState.LIVE)
+        self.assertIsNone(runtime.eviction_started_at)
+        self.assertEqual(runtime.subscribers, {"client-2"})
+
     def test_historical_hydration_singleflight_key_includes_data_type_and_effective_date(self) -> None:
         service = HistoricalHydrationService()
         first_key = HydrationKey("00700.HK", "minute_bars", "20260522")
@@ -791,6 +990,66 @@ class FakeMarketDataClient:
         if self.fail_on == action:
             raise RuntimeError(f"{action} failed")
         self.calls.append((action, symbol))
+
+
+class FakeXtData:
+    def __init__(self, *, connect_failures_by_port: dict[int, Exception] | None = None) -> None:
+        self.calls: list[tuple] = []
+        self.callbacks = {}
+        self.next_seq = 1
+        self.connect_failures_by_port = connect_failures_by_port or {}
+
+    def start_client(self) -> None:
+        self.calls.append(("start_client", ""))
+
+    def connect(self) -> None:
+        self.calls.append(("connect", ""))
+
+    def disconnect(self) -> None:
+        self.calls.append(("disconnect", ""))
+
+    def stop(self) -> None:
+        self.calls.append(("stop", ""))
+
+    def connect(self, host: str, port: int) -> None:
+        self.calls.append(("connect", host, port))
+        failure = self.connect_failures_by_port.get(port)
+        if failure is not None:
+            raise failure
+
+    def subscribe_quote(self, stock_code: str, period: str, start_time: str, end_time: str, count: int, callback):
+        self.calls.append(("subscribe_quote", stock_code, period))
+        self.callbacks[(stock_code, period)] = callback
+        seq = self.next_seq
+        self.next_seq += 1
+        return seq
+
+    def unsubscribe_quote(self, seq):
+        self.calls.append(("unsubscribe_quote", seq))
+
+
+class FakeXtDataCenter:
+    def __init__(self, *, listen_error: OSError | None = None) -> None:
+        self.listen_error = listen_error
+        self.listen_calls: list[int] = []
+
+    def set_token(self, token: str) -> None:
+        return None
+
+    def set_allow_optmize_address(self, addresses: list[str]) -> None:
+        return None
+
+    def set_data_home_dir(self, data_home: str) -> None:
+        return None
+
+    def init(self, flag: bool) -> None:
+        return None
+
+    def listen(self, port: int) -> None:
+        self.listen_calls.append(port)
+        if self.listen_error is not None:
+            raise self.listen_error
+        return None
 
 
 if __name__ == "__main__":

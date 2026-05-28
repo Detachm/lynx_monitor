@@ -11,7 +11,8 @@ from json import JSONDecodeError
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
-from .adapters import BoundedRawEventQueue, FileBackedSpool, ReliableEventBus
+from .adapters import BoundedRawEventQueue, DeadLetterRecord, FileBackedSpool, ReliableEventBus
+from .active_pool import ActivePoolConfig, ActiveSymbolPoolManager, DEFAULT_EXCLUDE_INSTRUMENT_TYPES
 from .contracts import (
     PROCESSED_TOPIC,
     RAW_TOPIC,
@@ -25,7 +26,7 @@ from .contracts import (
 from .freshness import FreshnessPolicy
 from .gateway_transport import GatewayV2SessionManager
 from .mammoth_api import DuckDBParquetSilverTableReader, MammothAPI
-from .pipeline import GatewayV2, OctopusComputeV2, RealtimeCollectorV2
+from .pipeline import GatewayV2, OctopusComputeV2, RealtimeCollectorV2, minute_bucket, rollover_realtime_session, snapshot_trade_date
 from .production_adapters import (
     KafkaAdapterConfig,
     KafkaEventBusAdapter,
@@ -37,6 +38,8 @@ from .runtime import (
     RawEventConsumerWorker,
     RealtimeIngestWorker,
     XtQuantSubscriptionManager,
+    normalize_subscription_symbol,
+    normalize_source_timestamp,
     normalize_xtquant_callback,
 )
 from .runtime_state import RuntimeStateStore
@@ -73,7 +76,13 @@ class BeastMarketRuntimeConfig:
     kafka_retries: int = 3
     symbol_eviction_grace_seconds: float = 300
     max_concurrent_hydrations: int = 8
+    max_raw_records_per_tick: int = 50
+    startup_intraday_recovery: bool = True
+    persist_realtime_events: bool = True
+    commit_runtime_owned_raw_offsets: bool = True
     big_trade_volume_baseline_ratio: float = 0.0005
+    hydrate_historical_alerts: bool = False
+    active_pool: ActivePoolConfig = field(default_factory=ActivePoolConfig)
     freshness_policy: FreshnessPolicy = FreshnessPolicy()
     kafka: KafkaAdapterConfig = KafkaAdapterConfig()
     redis: RedisAdapterConfig = RedisAdapterConfig()
@@ -103,6 +112,7 @@ class BeastMarketRuntime:
     octopus: OctopusComputeV2
     raw_consumer_worker: RawEventConsumerWorker
     gateway: GatewayV2
+    active_pool_manager: ActiveSymbolPoolManager
     symbol_runtime_manager: SymbolRuntimeManager
     session_manager: GatewayV2SessionManager
     websocket_service: GatewayV2WebSocketService
@@ -158,7 +168,11 @@ class BeastMarketRuntimeSupervisor:
         self.running = False
 
     def start(self, symbols: list[str] | None = None) -> None:
-        symbol_list = symbols or []
+        requested_symbols = normalize_startup_symbols(symbols or [])
+        if requested_symbols:
+            symbol_list = self.runtime.active_pool_manager.bootstrap_explicit_symbols(requested_symbols)
+        else:
+            symbol_list = self.runtime.active_pool_manager.rebuild_base_active()
         self._transition(RuntimeLifecycleState.BOOTSTRAP)
         readiness = evaluate_monitoring_historical_readiness(
             self.runtime.mammoth,
@@ -188,8 +202,14 @@ class BeastMarketRuntimeSupervisor:
             self._transition(RuntimeLifecycleState.CACHE_WARMING)
             for symbol in symbol_list:
                 cached_snapshot = cached_snapshots.get(symbol)
+                if isinstance(cached_snapshot, dict):
+                    apply_symbol_display_name(self.runtime, symbol, cached_snapshot)
                 effective_trade_date = effective_trade_dates[symbol]
-                if cached_snapshot is not None and is_terminal_snapshot_fresh(cached_snapshot, effective_trade_date):
+                if cached_snapshot is not None and is_terminal_snapshot_usable(
+                    cached_snapshot,
+                    requested_trade_date=self.runtime.config.trade_date,
+                    effective_trade_date=effective_trade_date,
+                ):
                     self.runtime.octopus.ensure_bod_context(
                         symbol,
                         effective_trade_date,
@@ -209,20 +229,24 @@ class BeastMarketRuntimeSupervisor:
                     mark_snapshot_degraded(current_snapshot, cache_read_error)
             self._transition(RuntimeLifecycleState.RECOVERING_INTRADAY)
             for symbol in symbol_list:
-                recover_symbol_intraday(
-                    self.runtime,
-                    symbol,
-                    cached_snapshot=cached_snapshots.get(symbol),
-                    data_trade_date=effective_trade_dates[symbol],
-                )
+                if self.runtime.config.startup_intraday_recovery:
+                    recover_symbol_intraday(
+                        self.runtime,
+                        symbol,
+                        cached_snapshot=cached_snapshots.get(symbol),
+                        data_trade_date=effective_trade_dates[symbol],
+                    )
                 current_snapshot = self.runtime.octopus.get_state(symbol)
                 if isinstance(current_snapshot, dict):
+                    if should_attach_realtime_for_symbol(self.runtime, symbol):
+                        promote_snapshot_to_realtime_session(self.runtime, symbol, current_snapshot)
                     self.runtime.symbol_runtime_manager.seed_snapshot(symbol, current_snapshot)
             if self.runtime.subscription_manager is not None:
                 self.runtime.subscription_manager.start()
                 for symbol in symbol_list:
                     if should_attach_realtime_for_symbol(self.runtime, symbol):
-                        self.runtime.subscription_manager.subscribe(symbol)
+                        self.runtime.symbol_runtime_manager.activate_symbol(symbol, strict_realtime=True)
+                        seed_symbol_from_market_full_tick(self.runtime, symbol)
             self.running = True
             self.stats.starts += 1
             self.stats.started_at = now_iso()
@@ -258,37 +282,50 @@ class BeastMarketRuntimeSupervisor:
         now: str | None = None,
         max_raw_records: int | None = None,
     ) -> dict[str, Any]:
-        ingested = self.runtime.ingest_worker.drain_all()
-        processed = self.runtime.raw_consumer_worker.poll_and_process(
-            self.runtime.config.trade_date,
-            max_records=max_raw_records,
-        )
+        ingested = drain_ingest_worker(self.runtime.ingest_worker, max_raw_records)
         runtime_owned_raw_path = self.runtime.raw_consumer_worker.runtime_event_processor is not None
-        for raw_event in ingested:
-            self.runtime.runtime_state.append_raw_event(self.runtime.config.trade_date, raw_event["symbol"], raw_event)
-        for processed_event in processed:
-            self.runtime.runtime_state.append_processed_event(
+        if runtime_owned_raw_path:
+            processed, direct_terminal_messages = process_runtime_owned_raw_events(
+                self.runtime.raw_consumer_worker,
+                ingested,
                 self.runtime.config.trade_date,
-                processed_event["symbol"],
-                processed_event,
+                commit_offsets=self.runtime.config.commit_runtime_owned_raw_offsets,
             )
+        else:
+            processed = self.runtime.raw_consumer_worker.poll_and_process(
+                self.runtime.config.trade_date,
+                max_records=max_raw_records,
+            )
+            direct_terminal_messages = self.runtime.gateway.terminal_messages_from_processed(processed)
+        if self.runtime.config.persist_realtime_events:
+            for raw_event in ingested:
+                self.runtime.runtime_state.append_raw_event(self.runtime.config.trade_date, raw_event["symbol"], raw_event)
+            for processed_event in processed:
+                self.runtime.runtime_state.append_processed_event(
+                    self.runtime.config.trade_date,
+                    processed_event["symbol"],
+                    processed_event,
+                )
         runtime_processed_events_applied = (
             len(processed)
             if runtime_owned_raw_path
             else self.runtime.symbol_runtime_manager.apply_processed_events(processed)
         )
-        direct_terminal_messages = (
-            list(self.runtime.raw_consumer_worker.last_terminal_messages)
-            if runtime_owned_raw_path
-            else self.runtime.gateway.terminal_messages_from_processed(processed)
-        )
+        if runtime_owned_raw_path:
+            self.runtime.raw_consumer_worker.last_terminal_messages = list(direct_terminal_messages)
         self.runtime.gateway.record_direct_terminal_messages(direct_terminal_messages)
         direct_terminal_enqueued = self.runtime.session_manager.broadcast_runtime_messages(
             direct_terminal_messages,
             update_symbol_runtime=False,
         )
         self.runtime.symbol_runtime_manager.mark_deltas_delivered(direct_terminal_messages, direct_terminal_enqueued)
-        shadow_processed_drained = self.runtime.gateway.drain_processed_shadow_records()
+        if runtime_owned_raw_path and not self.runtime.config.commit_runtime_owned_raw_offsets:
+            shadow_processed_drained = 0
+        else:
+            try:
+                shadow_processed_drained = self.runtime.gateway.drain_processed_shadow_records()
+            except Exception:
+                shadow_processed_drained = 0
         freshness = None
         if self.runtime.subscription_manager is not None:
             freshness = self.runtime.subscription_manager.check_freshness_and_resubscribe(now=now)
@@ -320,6 +357,62 @@ class BeastMarketRuntimeSupervisor:
         return build_runtime_health_snapshot(self, generated_at=generated_at)
 
 
+def drain_ingest_worker(worker: RealtimeIngestWorker, max_records: int | None = None) -> list[dict[str, Any]]:
+    if max_records is not None and max_records <= 0:
+        return []
+    events: list[dict[str, Any]] = []
+    while worker.queue.backlog and (max_records is None or len(events) < max_records):
+        event = worker.drain_once()
+        if event is not None:
+            events.append(event)
+    return events
+
+
+def process_runtime_owned_raw_events(
+    worker: RawEventConsumerWorker,
+    raw_events: list[dict[str, Any]],
+    trade_date: str,
+    *,
+    commit_offsets: bool = True,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    processed_events: list[dict[str, Any]] = []
+    terminal_messages: list[dict[str, Any]] = []
+    for raw_event in raw_events:
+        try:
+            processed, messages = worker._process_raw_event(raw_event, trade_date)
+        except Exception as error:
+            worker.stats.failed += 1
+            worker.stats.dead_letters.append(
+                DeadLetterRecord(
+                    topic=worker.topic,
+                    key=str(raw_event.get("symbol") or ""),
+                    value=raw_event,
+                    reason=str(error),
+                )
+            )
+            continue
+        processed_events.extend(processed)
+        terminal_messages.extend(messages)
+        worker.stats.processed += 1
+    if raw_events and commit_offsets:
+        next_offset = worker.consumer.committed_offset(worker.topic) + len(raw_events)
+        try:
+            worker.consumer.commit(worker.topic, next_offset)
+        except Exception as error:
+            worker.stats.failed += 1
+            worker.stats.dead_letters.append(
+                DeadLetterRecord(
+                    topic=worker.topic,
+                    key="",
+                    value={},
+                    reason=f"runtime_owned_raw_commit_failed: {error}",
+                )
+            )
+        else:
+            worker.stats.committed_offset = next_offset
+    return processed_events, terminal_messages
+
+
 async def run_supervised_runtime(
     supervisor: BeastMarketRuntimeSupervisor,
     *,
@@ -327,6 +420,7 @@ async def run_supervised_runtime(
     tick_interval_seconds: float = 0.25,
     health_snapshot_path: str | Path | None = None,
     health_snapshot_every_ticks: int = 1,
+    health_snapshot_interval_seconds: float | None = None,
     stop: asyncio.Event | None = None,
     serve_factory: Any | None = None,
     shadow_recorder: Any | None = None,
@@ -342,6 +436,8 @@ async def run_supervised_runtime(
 
     if health_snapshot_every_ticks <= 0:
         raise ValueError("health_snapshot_every_ticks must be positive")
+    if health_snapshot_interval_seconds is not None and health_snapshot_interval_seconds <= 0:
+        raise ValueError("health_snapshot_interval_seconds must be positive")
     if tick_interval_seconds < 0:
         raise ValueError("tick_interval_seconds must be non-negative")
 
@@ -353,6 +449,7 @@ async def run_supervised_runtime(
     websocket_service = supervisor.runtime.websocket_service
     previous_shadow_recorder = websocket_service.shadow_recorder
     signal_controller: RuntimeSignalStopController | None = None
+    health_snapshot_task: asyncio.Task | None = None
 
     supervisor.start(symbols or [])
     try:
@@ -361,13 +458,28 @@ async def run_supervised_runtime(
             signal_controller = install_runtime_signal_handlers(stop_event)
         if shadow_recorder is not None:
             websocket_service.shadow_recorder = shadow_recorder
+        if snapshot_path is not None and health_snapshot_interval_seconds is not None:
+            health_snapshot_task = asyncio.create_task(
+                runtime_health_snapshot_loop(
+                    supervisor,
+                    snapshot_path,
+                    interval_seconds=health_snapshot_interval_seconds,
+                    stop=stop_event,
+                )
+            )
         async with websocket_service.serve(serve_factory=serve_factory):
             while not stop_event.is_set():
-                tick_result = await supervisor.tick_once()
+                tick_result = await supervisor.tick_once(
+                    max_raw_records=supervisor.runtime.config.max_raw_records_per_tick,
+                )
                 ticks += 1
                 if shadow_recorder is not None:
                     record_v2_runtime_tick(shadow_recorder, tick_result)
-                if snapshot_path is not None and ticks % health_snapshot_every_ticks == 0:
+                if (
+                    snapshot_path is not None
+                    and health_snapshot_interval_seconds is None
+                    and ticks % health_snapshot_every_ticks == 0
+                ):
                     final_snapshot = write_runtime_health_snapshot(supervisor, snapshot_path)
                 if max_ticks is not None and ticks >= max_ticks:
                     stop_reason = "max_ticks"
@@ -382,6 +494,12 @@ async def run_supervised_runtime(
                 else:
                     stop_reason = "stop_event"
     finally:
+        if health_snapshot_task is not None:
+            health_snapshot_task.cancel()
+            try:
+                await health_snapshot_task
+            except asyncio.CancelledError:
+                pass
         if signal_controller is not None:
             signal_controller.cleanup()
         websocket_service.shadow_recorder = previous_shadow_recorder
@@ -398,6 +516,23 @@ async def run_supervised_runtime(
         final_health_snapshot=final_snapshot,
         stop_reason=stop_reason,
     )
+
+
+async def runtime_health_snapshot_loop(
+    supervisor: BeastMarketRuntimeSupervisor,
+    path: str | Path,
+    *,
+    interval_seconds: float,
+    stop: asyncio.Event,
+) -> None:
+    if interval_seconds <= 0:
+        raise ValueError("interval_seconds must be positive")
+    while not stop.is_set():
+        write_runtime_health_snapshot(supervisor, path)
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=interval_seconds)
+        except TimeoutError:
+            continue
 
 
 def install_runtime_signal_handlers(
@@ -464,6 +599,7 @@ def build_beast_market_runtime(
         event_bus,
         cache,
         big_trade_volume_baseline_ratio=config.big_trade_volume_baseline_ratio,
+        hydrate_historical_alerts=config.hydrate_historical_alerts,
     )
     raw_consumer_worker = RawEventConsumerWorker(
         kafka_adapter,
@@ -478,6 +614,11 @@ def build_beast_market_runtime(
         ),
     )
     gateway = GatewayV2(event_bus, cache)
+    active_pool_manager = ActiveSymbolPoolManager(
+        mammoth,
+        trade_date=config.trade_date,
+        config=config.active_pool,
+    )
     symbol_runtime_manager = SymbolRuntimeManager(
         gateway,
         trade_date=config.trade_date,
@@ -489,7 +630,8 @@ def build_beast_market_runtime(
             symbol,
             snapshot,
         ),
-        eviction_grace_seconds=config.symbol_eviction_grace_seconds,
+        active_pool_manager=active_pool_manager,
+        eviction_grace_seconds=config.active_pool.eviction_grace_seconds,
         max_concurrent_hydrations=config.max_concurrent_hydrations,
     )
     raw_consumer_worker.state_provider = symbol_runtime_manager.snapshot_payload
@@ -529,6 +671,7 @@ def build_beast_market_runtime(
         octopus=octopus,
         raw_consumer_worker=raw_consumer_worker,
         gateway=gateway,
+        active_pool_manager=active_pool_manager,
         symbol_runtime_manager=symbol_runtime_manager,
         session_manager=session_manager,
         websocket_service=websocket_service,
@@ -538,6 +681,7 @@ def build_beast_market_runtime(
         should_attach=lambda symbol: should_attach_realtime_for_symbol(runtime, symbol),
     )
     symbol_runtime_manager.hydrate_symbol = lambda symbol: hydrate_symbol_snapshot(runtime, symbol)
+    session_manager.realtime_seed_provider = lambda symbol: seed_symbol_from_market_full_tick(runtime, symbol)
     return runtime
 
 
@@ -653,12 +797,135 @@ def effective_trade_date_for_symbol(
     return latest_date or requested_trade_date
 
 
+def normalize_startup_symbols(symbols: list[str]) -> list[str]:
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw_symbol in symbols:
+        try:
+            symbol = normalize_subscription_symbol(raw_symbol)
+        except ValueError:
+            continue
+        if symbol not in seen:
+            seen.add(symbol)
+            normalized.append(symbol)
+    return normalized
+
+
 def should_attach_realtime_for_symbol(runtime: BeastMarketRuntime, symbol: str) -> bool:
     requested_trade_date = runtime.config.trade_date
     if runtime.effective_trade_date_by_symbol.get(symbol, requested_trade_date) == requested_trade_date:
         return True
     trading_day = runtime.mammoth.is_trading_day(requested_trade_date, market="HK")
-    return trading_day is True
+    return bool(trading_day)
+
+
+def promote_snapshot_to_realtime_session(runtime: BeastMarketRuntime, symbol: str, snapshot: dict[str, Any]) -> dict[str, Any]:
+    trade_date = runtime.config.trade_date
+    apply_symbol_display_name(runtime, symbol, snapshot)
+    if snapshot_trade_date(snapshot) == trade_date:
+        return snapshot
+    updated_at = now_iso()
+    rollover_realtime_session(snapshot, trade_date, updated_at)
+    freshness = dict(snapshot.get("freshness") or {})
+    source_dates = dict(freshness.get("source_dates") or {})
+    source_dates["realtime_session"] = trade_date
+    degraded_reasons = list(freshness.get("degraded_reasons") or [])
+    if "intraday_gap_before_attach" not in degraded_reasons:
+        degraded_reasons.append("intraday_gap_before_attach")
+    snapshot["freshness"] = {
+        **freshness,
+        "updated_at": updated_at,
+        "requested_trade_date": trade_date,
+        "effective_trade_date": trade_date,
+        "runtime_state": "LIVE",
+        "source_dates": source_dates,
+        "degraded": True,
+        "degraded_reasons": degraded_reasons,
+    }
+    runtime.octopus.set_state(symbol, snapshot)
+    runtime.cache.set_terminal_snapshot(trade_date, symbol, snapshot)
+    return snapshot
+
+
+def apply_symbol_display_name(runtime: BeastMarketRuntime, symbol: str, snapshot: dict[str, Any]) -> dict[str, Any]:
+    inner_snapshot = snapshot.get("snapshot")
+    if not isinstance(inner_snapshot, dict):
+        return snapshot
+    current_name = str(inner_snapshot.get("name") or "")
+    if current_name and current_name != symbol:
+        return snapshot
+    get_instrument_name = getattr(runtime.mammoth, "get_instrument_name", None)
+    try:
+        display_name = get_instrument_name(symbol) if callable(get_instrument_name) else ""
+    except Exception:
+        display_name = ""
+    if isinstance(display_name, str) and display_name.strip():
+        inner_snapshot["name"] = display_name.strip()
+    return snapshot
+
+
+def seed_symbol_from_market_full_tick(runtime: BeastMarketRuntime, symbol: str) -> list[dict[str, Any]]:
+    if runtime.subscription_manager is None:
+        return []
+    get_full_ticks = getattr(runtime.subscription_manager.client, "get_full_ticks", None)
+    if not callable(get_full_ticks):
+        return []
+    try:
+        ticks = get_full_ticks([symbol])
+    except Exception:
+        return []
+    full_tick = ticks.get(symbol)
+    if not isinstance(full_tick, dict):
+        return []
+    price = first_numeric(full_tick, "lastPrice", "last_price", "price")
+    volume = first_numeric(full_tick, "volume", "pvolume", "Volume")
+    turnover = first_numeric(full_tick, "amount", "turnover", "Amount")
+    if price is None or volume is None:
+        return []
+    raw_event = make_raw_market_event(
+        kind="tick",
+        symbol=symbol,
+        source="xtquant_full_tick",
+        seq=runtime.octopus.seq_by_symbol.get(symbol, 0) + 1,
+        source_ts=full_tick_source_ts(full_tick),
+        payload={
+            "price": float(price),
+            "volume": int(float(volume)),
+            "turnover": float(turnover if turnover is not None else float(price) * float(volume)),
+            "side": "",
+            "broker_code": "",
+        },
+        period="full_tick",
+    )
+    processed = runtime.octopus.process_raw_event(raw_event, runtime.config.trade_date)
+    runtime.runtime_state.append_raw_event(runtime.config.trade_date, symbol, raw_event)
+    for event in processed:
+        runtime.runtime_state.append_processed_event(runtime.config.trade_date, symbol, event)
+    runtime.symbol_runtime_manager.apply_processed_events(processed)
+    return processed
+
+
+def first_numeric(data: dict[str, Any], *keys: str) -> float | None:
+    for key in keys:
+        value = data.get(key)
+        if value in (None, ""):
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def full_tick_source_ts(full_tick: dict[str, Any]) -> str:
+    timetag = full_tick.get("timetag")
+    if isinstance(timetag, str) and len(timetag) >= 17:
+        try:
+            parsed = datetime.strptime(timetag[:17], "%Y%m%d %H:%M:%S")
+            return parsed.isoformat(timespec="milliseconds") + "+08:00"
+        except ValueError:
+            pass
+    return normalize_source_timestamp(full_tick.get("time") or full_tick.get("timestamp"))
 
 
 def mark_snapshot_degraded(snapshot: dict[str, Any], reason: str) -> dict[str, Any]:
@@ -717,24 +984,30 @@ def hydrate_symbol_snapshot(runtime: BeastMarketRuntime, symbol: str) -> dict[st
         requested_trade_date=requested_trade_date,
     )
     runtime.effective_trade_date_by_symbol[symbol] = effective_trade_date
-    if cached is not None and is_terminal_snapshot_fresh(cached, effective_trade_date):
+    if cached is not None and is_terminal_snapshot_usable(
+        cached,
+        requested_trade_date=requested_trade_date,
+        effective_trade_date=effective_trade_date,
+    ):
+        normalize_snapshot_minute_bars(cached)
+        apply_symbol_display_name(runtime, symbol, cached)
         runtime.octopus.ensure_bod_context(symbol, effective_trade_date, hydrate_participant_history=True)
         runtime.octopus.set_state(symbol, cached)
         return cached
-    return runtime.octopus.preload_bod(
+    snapshot = runtime.octopus.preload_bod(
         symbol,
         effective_trade_date,
         cache_trade_date=requested_trade_date,
         requested_trade_date=requested_trade_date,
-    ) if not cached_read_error else mark_snapshot_degraded(
-        runtime.octopus.preload_bod(
-            symbol,
-            effective_trade_date,
-            cache_trade_date=requested_trade_date,
-            requested_trade_date=requested_trade_date,
-        ),
-        cached_read_error,
     )
+    apply_symbol_display_name(runtime, symbol, snapshot)
+    if should_attach_realtime_for_symbol(runtime, symbol):
+        promote_snapshot_to_realtime_session(runtime, symbol, snapshot)
+        seed_symbol_from_market_full_tick(runtime, symbol)
+        seeded_snapshot = runtime.octopus.get_state(symbol)
+        if isinstance(seeded_snapshot, dict):
+            snapshot = seeded_snapshot
+    return snapshot if not cached_read_error else mark_snapshot_degraded(snapshot, cached_read_error)
 
 
 def recover_symbol_intraday(
@@ -886,6 +1159,46 @@ def is_terminal_snapshot_fresh(snapshot: dict[str, Any], trade_date: str) -> boo
     return isinstance(snapshot.get("minute_bars"), list) and bool(snapshot["minute_bars"])
 
 
+def is_terminal_snapshot_usable(
+    snapshot: dict[str, Any],
+    *,
+    requested_trade_date: str,
+    effective_trade_date: str,
+) -> bool:
+    return is_terminal_snapshot_fresh(snapshot, effective_trade_date) or is_terminal_snapshot_fresh(
+        snapshot,
+        requested_trade_date,
+    )
+
+
+def normalize_snapshot_minute_bars(snapshot: dict[str, Any]) -> None:
+    raw_bars = snapshot.get("minute_bars")
+    if not isinstance(raw_bars, list):
+        return
+    merged_by_minute: dict[str, dict[str, Any]] = {}
+    for raw_bar in raw_bars:
+        if not isinstance(raw_bar, dict):
+            continue
+        timestamp = str(raw_bar.get("timestamp") or "")
+        if not timestamp:
+            continue
+        bucket = minute_bucket(timestamp)
+        bar = dict(raw_bar)
+        bar["timestamp"] = bucket
+        previous = merged_by_minute.get(bucket)
+        if previous is None:
+            merged_by_minute[bucket] = bar
+            continue
+        previous["price"] = bar.get("price", bar.get("close", previous.get("price")))
+        previous["close"] = bar.get("close", bar.get("price", previous.get("close")))
+        previous["high"] = max(float(previous.get("high") or previous.get("price") or 0), float(bar.get("high") or bar.get("price") or 0))
+        previous["low"] = min(float(previous.get("low") or previous.get("price") or 0), float(bar.get("low") or bar.get("price") or 0))
+        previous["volume"] = int(previous.get("volume") or 0) + int(bar.get("volume") or 0)
+        previous["turnover"] = float(previous.get("turnover") or 0) + float(bar.get("turnover") or 0)
+        previous["direction"] = bar.get("direction", previous.get("direction", "flat"))
+    snapshot["minute_bars"] = [merged_by_minute[key] for key in sorted(merged_by_minute)]
+
+
 def snapshot_trade_date(snapshot: dict[str, Any]) -> str:
     inner_snapshot = snapshot.get("snapshot")
     if not isinstance(inner_snapshot, dict):
@@ -1002,6 +1315,7 @@ def runtime_config_from_artifact(config: dict[str, Any]) -> BeastMarketRuntimeCo
     gateway = config.get("gateway") if isinstance(config.get("gateway"), dict) else {}
     runtime = config.get("runtime") if isinstance(config.get("runtime"), dict) else {}
     freshness = config.get("freshness") if isinstance(config.get("freshness"), dict) else {}
+    active_pool = config.get("active_pool") if isinstance(config.get("active_pool"), dict) else {}
     return BeastMarketRuntimeConfig(
         trade_date=str(config.get("trade_date") or ""),
         silver_root=str(config.get("silver_root") or ""),
@@ -1015,7 +1329,26 @@ def runtime_config_from_artifact(config: dict[str, Any]) -> BeastMarketRuntimeCo
         kafka_retries=int_value(runtime.get("kafka_retries"), default=3),
         symbol_eviction_grace_seconds=float_value(runtime.get("symbol_eviction_grace_seconds"), default=300),
         max_concurrent_hydrations=int_value(runtime.get("max_concurrent_hydrations"), default=8),
+        max_raw_records_per_tick=int_value(runtime.get("max_raw_records_per_tick"), default=50),
+        startup_intraday_recovery=bool_value(runtime.get("startup_intraday_recovery"), default=True),
+        persist_realtime_events=bool_value(runtime.get("persist_realtime_events"), default=True),
+        commit_runtime_owned_raw_offsets=bool_value(runtime.get("commit_runtime_owned_raw_offsets"), default=True),
         big_trade_volume_baseline_ratio=float_value(runtime.get("big_trade_volume_baseline_ratio"), default=0.0005),
+        active_pool=ActivePoolConfig(
+            target_size=int_value(active_pool.get("target_size"), default=200),
+            pinned_max_size=int_value(active_pool.get("pinned_max_size"), default=100),
+            rank_window_days=int_value(active_pool.get("rank_window_days"), default=5),
+            rank_metric=str(active_pool.get("rank_metric") or "avg_turnover"),
+            exclude_instrument_types=tuple(
+                str(value)
+                for value in (
+                    active_pool.get("exclude_instrument_types")
+                    if isinstance(active_pool.get("exclude_instrument_types"), list)
+                    else DEFAULT_EXCLUDE_INSTRUMENT_TYPES
+                )
+            ),
+            eviction_grace_seconds=float_value(active_pool.get("eviction_grace_seconds"), default=300),
+        ),
         freshness_policy=FreshnessPolicy(
             max_event_age_seconds=float_value(freshness.get("max_event_age_seconds"), default=60),
             max_queue_backlog=int_value(freshness.get("max_queue_backlog"), default=1_000),
@@ -1024,7 +1357,7 @@ def runtime_config_from_artifact(config: dict[str, Any]) -> BeastMarketRuntimeCo
             raw_topic=str(kafka.get("raw_topic") or RAW_TOPIC),
             processed_topic=str(kafka.get("processed_topic") or PROCESSED_TOPIC),
             consumer_group=str(kafka.get("consumer_group") or "beast-terminal-v2"),
-            poll_timeout_ms=int_value(kafka.get("poll_timeout_ms"), default=1000),
+            poll_timeout_ms=int_value(kafka.get("poll_timeout_ms"), default=1),
             auto_offset_reset=str(kafka.get("auto_offset_reset") or "latest"),
         ),
         redis=RedisAdapterConfig(
@@ -1044,6 +1377,7 @@ def evaluate_runtime_config_artifact(config: dict[str, Any]) -> dict[str, Any]:
     redis = config.get("redis") if isinstance(config.get("redis"), dict) else {}
     runtime = config.get("runtime") if isinstance(config.get("runtime"), dict) else {}
     freshness = config.get("freshness") if isinstance(config.get("freshness"), dict) else {}
+    active_pool = config.get("active_pool") if isinstance(config.get("active_pool"), dict) else {}
     production_clients = config.get("production_clients") if isinstance(config.get("production_clients"), dict) else {}
     secret_paths = secret_like_paths(config)
 
@@ -1092,7 +1426,7 @@ def evaluate_runtime_config_artifact(config: dict[str, Any]) -> dict[str, Any]:
         blockers.append("runtime_config_redis_terminal_ttl_invalid")
     if not positive_integer(redis.get("history_ttl_seconds")):
         blockers.append("runtime_config_redis_history_ttl_invalid")
-    for field in ("raw_queue_max_size", "client_queue_size", "max_concurrent_hydrations"):
+    for field in ("raw_queue_max_size", "client_queue_size", "max_concurrent_hydrations", "max_raw_records_per_tick"):
         if not positive_integer(runtime.get(field)):
             blockers.append(f"runtime_config_{field}_invalid")
     if not non_negative_integer(runtime.get("kafka_retries")):
@@ -1103,8 +1437,27 @@ def evaluate_runtime_config_artifact(config: dict[str, Any]) -> dict[str, Any]:
         blockers.append("runtime_config_big_trade_volume_ratio_invalid")
     if "big_trade_turnover_threshold" in runtime:
         blockers.append("runtime_config_big_trade_turnover_threshold_deprecated")
+    if active_pool:
+        if not positive_integer(active_pool.get("target_size")):
+            blockers.append("runtime_config_active_pool_target_size_invalid")
+        if not positive_integer(active_pool.get("pinned_max_size")):
+            blockers.append("runtime_config_active_pool_pinned_max_size_invalid")
+        if not positive_integer(active_pool.get("rank_window_days")):
+            blockers.append("runtime_config_active_pool_rank_window_days_invalid")
+        if active_pool.get("rank_metric") not in {"avg_turnover", "avg_volume"}:
+            blockers.append("runtime_config_active_pool_rank_metric_invalid")
+        if not isinstance(active_pool.get("exclude_instrument_types"), list) or not active_pool.get("exclude_instrument_types"):
+            blockers.append("runtime_config_active_pool_exclude_types_invalid")
+        if not positive_number(active_pool.get("eviction_grace_seconds")):
+            blockers.append("runtime_config_active_pool_eviction_grace_invalid")
     if runtime.get("install_signal_handlers") is not True:
         blockers.append("runtime_config_signal_handlers_not_enabled")
+    if not isinstance(runtime.get("startup_intraday_recovery"), bool):
+        blockers.append("runtime_config_startup_intraday_recovery_invalid")
+    if not isinstance(runtime.get("persist_realtime_events"), bool):
+        blockers.append("runtime_config_persist_realtime_events_invalid")
+    if not isinstance(runtime.get("commit_runtime_owned_raw_offsets"), bool):
+        blockers.append("runtime_config_commit_runtime_owned_raw_offsets_invalid")
     if not positive_number(freshness.get("max_event_age_seconds")):
         blockers.append("runtime_config_freshness_event_age_invalid")
     if not positive_integer(freshness.get("max_queue_backlog")):
@@ -1137,8 +1490,20 @@ def evaluate_runtime_config_artifact(config: dict[str, Any]) -> dict[str, Any]:
             "kafka_retries": runtime.get("kafka_retries"),
             "symbol_eviction_grace_seconds": runtime.get("symbol_eviction_grace_seconds"),
             "max_concurrent_hydrations": runtime.get("max_concurrent_hydrations"),
+            "max_raw_records_per_tick": runtime.get("max_raw_records_per_tick"),
+            "startup_intraday_recovery": runtime.get("startup_intraday_recovery"),
+            "persist_realtime_events": runtime.get("persist_realtime_events"),
+            "commit_runtime_owned_raw_offsets": runtime.get("commit_runtime_owned_raw_offsets"),
             "big_trade_volume_baseline_ratio": runtime.get("big_trade_volume_baseline_ratio"),
             "install_signal_handlers": runtime.get("install_signal_handlers"),
+        },
+        "active_pool": {
+            "target_size": active_pool.get("target_size"),
+            "pinned_max_size": active_pool.get("pinned_max_size"),
+            "rank_window_days": active_pool.get("rank_window_days"),
+            "rank_metric": active_pool.get("rank_metric"),
+            "exclude_instrument_types": active_pool.get("exclude_instrument_types"),
+            "eviction_grace_seconds": active_pool.get("eviction_grace_seconds"),
         },
         "freshness": {
             "max_event_age_seconds": freshness.get("max_event_age_seconds"),
@@ -1180,6 +1545,10 @@ def float_value(value: Any, *, default: float) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def bool_value(value: Any, *, default: bool) -> bool:
+    return value if isinstance(value, bool) else default
 
 
 def is_loopback_gateway_host(value: str) -> bool:
@@ -1337,6 +1706,7 @@ def build_runtime_health_snapshot(
             "write_stats": runtime.cache.stats_snapshot(),
         },
         "subscription": subscription,
+        "active_pool": runtime.active_pool_manager.snapshot(),
         "symbol_runtime_manager": runtime.symbol_runtime_manager.manager_snapshot(),
         "symbol_runtime": runtime.symbol_runtime_manager.snapshot(),
         "redis_snapshot": redis_snapshot,
@@ -1348,6 +1718,8 @@ def build_runtime_health_snapshot(
             "accepted_protocol": TERMINAL_MESSAGE_PROTOCOL,
             "running": supervisor.running,
             "connected_clients": len(runtime.websocket_service.clients),
+            "failed_client_sends": runtime.websocket_service.failed_client_sends,
+            "send_timeout_seconds": runtime.websocket_service.send_timeout_seconds,
         },
         "gateway_activity": {
             "processed_records_consumed": runtime.gateway.processed_records_consumed,
@@ -1385,6 +1757,13 @@ def write_runtime_health_snapshot(
 
 def worker_stats_snapshot(stats: Any) -> dict[str, Any]:
     value = asdict(stats)
+    callback_samples = [
+        float(sample)
+        for sample in value.get("callback_enqueue_latency_ms", [])
+        if isinstance(sample, (int, float)) and not isinstance(sample, bool) and sample >= 0
+    ]
+    value["callback_enqueue_sample_count"] = len(callback_samples)
+    value["callback_enqueue_p95_latency_ms"] = percentile(callback_samples, 95)
     value["dead_letters"] = [
         {
             "topic": record.topic,
@@ -1396,18 +1775,36 @@ def worker_stats_snapshot(stats: Any) -> dict[str, Any]:
     return value
 
 
+def percentile(samples: list[float], percentile_value: float) -> float:
+    if not samples:
+        return 0.0
+    ordered = sorted(samples)
+    if len(ordered) == 1:
+        return ordered[0]
+    rank = (len(ordered) - 1) * percentile_value / 100
+    lower = int(rank)
+    upper = min(lower + 1, len(ordered) - 1)
+    weight = rank - lower
+    return ordered[lower] * (1 - weight) + ordered[upper] * weight
+
+
 def subscription_snapshot(manager: XtQuantSubscriptionManager | None) -> dict[str, Any] | None:
     if manager is None:
         return None
+    client_stats = None
+    stats_snapshot = getattr(manager.client, "stats_snapshot", None)
+    if callable(stats_snapshot):
+        client_stats = stats_snapshot()
     return {
         "running": manager.running,
         "subscribed_symbols": sorted(manager.subscribed_symbols),
         "stats": asdict(manager.stats),
+        "client": client_stats,
     }
 
 
 def redis_snapshot_probe(runtime: BeastMarketRuntime) -> dict[str, Any]:
-    symbols = set()
+    symbols = set(runtime.active_pool_manager.active_symbols())
     if runtime.subscription_manager is not None:
         symbols.update(runtime.subscription_manager.subscribed_symbols)
     for state in runtime.collector.freshness.snapshot().values():

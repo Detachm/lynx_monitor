@@ -95,6 +95,12 @@ Subscription flow:
 7. If market is open and symbol is eligible, runtime attaches realtime subscription.
 8. Gateway fans out deltas to every subscribed client.
 
+Trading-day display rule:
+
+- If the requested date is a trading day and realtime is expected, the first snapshot must not send previous-effective-day minute bars as today's chart. The runtime may use previous-effective-day silver for reference fields, previous close, CCASS, broker mapping, and baseline context, but it must roll the snapshot to the requested date and clear historical minute bars before returning the realtime first screen.
+- If the requested date is not a trading day, the terminal may display the latest effective trading day's minute bars with `requested_trade_date`, `effective_trade_date`, and `source_dates` evidence in freshness.
+- If the runtime attaches after the trading day has already opened and cannot replay the missing raw interval, it records `intraday_gap_before_attach`; the same-day chart starts from the available realtime attach/replay point instead of mixing in previous-day bars.
+
 Unsubscribe flow:
 
 1. Client sends `unsubscribe(symbol)` or disconnects.
@@ -230,6 +236,8 @@ Recovery priority:
 4. Replay only the missing short tick window needed for alert continuity.
 5. Attach realtime subscription if market is open.
 6. Emit health evidence with recovered source dates and gaps.
+
+For non-trading requested dates, recovery may return the latest effective trading day's native 1m bars. For trading requested dates where realtime is expected but same-day silver 1m bars are unavailable, recovery must not expose previous-day minute bars as the same-day chart; it rolls to the requested date and waits for realtime or replayed same-day raw facts.
 
 Local JSONL is an audit and debugging artifact. It may help recovery, but it is not the primary hot recovery mechanism.
 

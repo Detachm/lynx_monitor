@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from time import monotonic, perf_counter
 from typing import Any, Callable, Protocol
 
 from .adapters import (
@@ -19,6 +20,7 @@ CallbackRejectSink = Callable[[dict[str, Any], str], None]
 StateProvider = Callable[[str], dict[str, Any] | None]
 RuntimeRawEventProcessor = Callable[[dict[str, Any], str], tuple[list[dict[str, Any]], list[dict[str, Any]]]]
 RawDeadLetterSink = Callable[[DeadLetterRecord], None]
+MAX_CALLBACK_LATENCY_SAMPLES = 500
 
 
 @dataclass
@@ -29,6 +31,9 @@ class WorkerStats:
     processed: int = 0
     failed: int = 0
     committed_offset: int = 0
+    callback_enqueue_last_latency_ms: float = 0.0
+    callback_enqueue_max_latency_ms: float = 0.0
+    callback_enqueue_latency_ms: list[float] = field(default_factory=list)
     dead_letters: list[DeadLetterRecord] = field(default_factory=list)
 
 
@@ -60,9 +65,19 @@ class SubscriptionStats:
 class XtQuantSubscriptionManager:
     """Owns xtquant subscription lifecycle without hiding client failures."""
 
-    def __init__(self, client: MarketDataSubscriptionClient, collector: RealtimeCollectorV2) -> None:
+    def __init__(
+        self,
+        client: MarketDataSubscriptionClient,
+        collector: RealtimeCollectorV2,
+        *,
+        resubscribe_cooldown_seconds: float = 30,
+    ) -> None:
+        if resubscribe_cooldown_seconds < 0:
+            raise ValueError("resubscribe_cooldown_seconds must be >= 0")
         self.client = client
         self.collector = collector
+        self.resubscribe_cooldown_seconds = resubscribe_cooldown_seconds
+        self.last_resubscribe_at_by_symbol: dict[str, float] = {}
         self.stats = SubscriptionStats()
         self.running = False
         self.subscribed_symbols: set[str] = set()
@@ -80,6 +95,7 @@ class XtQuantSubscriptionManager:
     def stop(self) -> None:
         try:
             self.client.stop()
+            self.subscribed_symbols.clear()
             self.running = False
             self.stats.stops += 1
             self.collector.health.process = "stopped"
@@ -112,9 +128,26 @@ class XtQuantSubscriptionManager:
     def check_freshness_and_resubscribe(self, *, now: str | None = None) -> dict[str, Any]:
         result = self.collector.evaluate_freshness(now=now)
         for symbol in result["resubscribe_symbols"]:
-            if symbol in self.subscribed_symbols:
+            if symbol in self.subscribed_symbols and self._should_resubscribe(symbol, result):
                 self._resubscribe(symbol)
         return result
+
+    def _should_resubscribe(self, symbol: str, freshness_result: dict[str, Any]) -> bool:
+        symbol_freshness = freshness_result.get("symbol_freshness")
+        if isinstance(symbol_freshness, dict):
+            reasons = [
+                str(item.get("degraded_reason") or "")
+                for item in symbol_freshness.values()
+                if isinstance(item, dict) and item.get("symbol") == symbol
+            ]
+            if any(reason == "queue_backlog_exceeded" for reason in reasons):
+                return False
+        now_value = monotonic()
+        previous = self.last_resubscribe_at_by_symbol.get(symbol)
+        if previous is not None and now_value - previous < self.resubscribe_cooldown_seconds:
+            return False
+        self.last_resubscribe_at_by_symbol[symbol] = now_value
+        return True
 
     def _resubscribe(self, symbol: str) -> None:
         try:
@@ -150,8 +183,15 @@ class RealtimeIngestWorker:
         self.stats = WorkerStats()
 
     def receive_callback(self, payload: dict[str, Any]) -> bool:
+        started = perf_counter()
         self.stats.received += 1
         accepted = self.queue.push(payload)
+        latency_ms = max(0.0, (perf_counter() - started) * 1000)
+        self.stats.callback_enqueue_last_latency_ms = latency_ms
+        self.stats.callback_enqueue_max_latency_ms = max(self.stats.callback_enqueue_max_latency_ms, latency_ms)
+        self.stats.callback_enqueue_latency_ms.append(latency_ms)
+        if len(self.stats.callback_enqueue_latency_ms) > MAX_CALLBACK_LATENCY_SAMPLES:
+            del self.stats.callback_enqueue_latency_ms[: len(self.stats.callback_enqueue_latency_ms) - MAX_CALLBACK_LATENCY_SAMPLES]
         if accepted:
             self.stats.enqueued += 1
         else:
@@ -265,6 +305,7 @@ class RawEventConsumerWorker:
         processed_events: list[dict[str, Any]] = []
         self.last_terminal_messages = []
         next_offset = offset
+        should_commit = False
         for record in records:
             try:
                 validate_event_bus_record_inputs(self.topic, record)
@@ -273,8 +314,8 @@ class RawEventConsumerWorker:
                 processed, terminal_messages = self._process_raw_event(raw_event, trade_date)
                 processed_events.extend(processed)
                 self.last_terminal_messages.extend(terminal_messages)
-                next_offset += 1
-                self.consumer.commit(self.topic, next_offset)
+                next_offset = int(record.get("offset", next_offset)) + 1
+                should_commit = True
                 self.stats.committed_offset = next_offset
                 self.stats.processed += 1
             except Exception as error:
@@ -288,11 +329,14 @@ class RawEventConsumerWorker:
                 self.stats.dead_letters.append(dead_letter)
                 self._write_dead_letter(dead_letter)
                 if self.skip_bad_records:
-                    next_offset += 1
-                    self.consumer.commit(self.topic, next_offset)
+                    next_offset = int(record.get("offset", next_offset)) + 1
+                    should_commit = True
                     self.stats.committed_offset = next_offset
                     continue
                 break
+        if should_commit:
+            self.consumer.commit(self.topic, next_offset)
+            self.stats.committed_offset = next_offset
         return processed_events
 
     def _process_raw_event(self, raw_event: dict[str, Any], trade_date: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -371,12 +415,12 @@ def normalize_xtquant_callback(payload: dict[str, Any]) -> dict[str, Any]:
             "payload": tick_payload,
         }
 
-    if period in {"hkbrokerqueueex", "broker_queue", "brokerqueue"}:
+    if period in {"hkbrokerqueueex", "broker_queue", "brokerqueue", "brokerqueue2"}:
         source_ts = normalize_source_timestamp(first_present(data, "_Collect_time", "_collect_time", "Time", "time"))
         return {
             "kind": "broker_queue",
             "symbol": symbol,
-            "period": "hkbrokerqueueex",
+            "period": period if period == "brokerqueue2" else "hkbrokerqueueex",
             "source_ts": source_ts,
             "payload": {"side": data.get("Side") or data.get("side"), "entries": normalize_legacy_broker_queue(data)},
         }

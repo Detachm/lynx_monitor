@@ -117,6 +117,40 @@ class ProductionAdapterTest(unittest.TestCase):
         self.assertEqual(adapter.committed_offset("raw_market_events_v1"), 1)
         self.assertEqual(adapter.lag("raw_market_events_v1", 1), 2)
 
+    def test_kafka_adapter_supports_confluent_style_consumer_messages(self) -> None:
+        consumer = FakeConfluentKafkaConsumer(
+            messages=[
+                FakeConfluentKafkaMessage(
+                    topic="raw_market_events_v1",
+                    key=b"00700.HK",
+                    value=b'{"event_id":"event-1","symbol":"00700.HK","payload":{}}',
+                    offset=2,
+                    partition=0,
+                )
+            ]
+        )
+        adapter = KafkaEventBusAdapter(
+            FakeKafkaProducer(),
+            consumer,
+            KafkaAdapterConfig(poll_timeout_ms=1, max_poll_records=10),
+        )
+
+        records = adapter.poll("raw_market_events_v1", 0)
+        adapter.commit("raw_market_events_v1", 3)
+
+        self.assertEqual(consumer.subscriptions, [["raw_market_events_v1"]])
+        self.assertEqual(records, [
+            {
+                "key": "00700.HK",
+                "value": {"event_id": "event-1", "symbol": "00700.HK", "payload": {}},
+                "offset": 2,
+                "partition": 0,
+                "topic": "raw_market_events_v1",
+            }
+        ])
+        self.assertEqual(adapter.committed_offset("raw_market_events_v1"), 3)
+        self.assertEqual(consumer.commit_count, 1)
+
     def test_redis_adapter_writes_terminal_keys_with_ttl_and_reads_snapshot(self) -> None:
         redis = FakeRedisWithPipeline()
         adapter = RedisSnapshotCacheAdapter(
@@ -179,6 +213,52 @@ class ProductionAdapterTest(unittest.TestCase):
         self.assertEqual(stats["failures"], 0)
         self.assertGreaterEqual(stats["last_latency_ms"], 0)
         self.assertGreaterEqual(stats["max_latency_ms"], stats["last_latency_ms"])
+
+    def test_redis_adapter_merges_existing_minute_bars_when_runtime_snapshot_is_shorter(self) -> None:
+        redis = FakeRedisWithPipeline()
+        adapter = RedisSnapshotCacheAdapter(redis, RedisAdapterConfig(terminal_ttl_seconds=3600))
+        existing = {
+            "snapshot": {"symbol": "00700.HK", "price": 388.4, "tradeDate": "20260522"},
+            "minute_bars": [
+                {"timestamp": "2026-05-22T09:30:00+08:00", "price": 388.4, "volume": 1000, "turnover": 388400},
+                {"timestamp": "2026-05-22T09:31:00+08:00", "price": 388.6, "volume": 1100, "turnover": 427460},
+            ],
+            "alerts": [],
+            "broker_queue": {"ask": [], "bid": []},
+            "ccass_holdings": [],
+            "freshness": {
+                "updated_at": "2026-05-22T09:31:00+08:00",
+                "requested_trade_date": "20260522",
+                "effective_trade_date": "20260522",
+                "source_dates": {"minute_bars": "20260522"},
+                "runtime_state": "LIVE",
+                "degraded_reasons": [],
+            },
+        }
+        shorter_runtime_snapshot = {
+            **existing,
+            "snapshot": {"symbol": "00700.HK", "price": 389.0, "tradeDate": "20260522"},
+            "minute_bars": [
+                {"timestamp": "2026-05-22T09:32:12+08:00", "price": 389.0, "volume": 1200, "turnover": 466800}
+            ],
+        }
+
+        adapter.set_terminal_snapshot("20260522", "00700.HK", existing)
+        adapter.set_terminal_snapshot("20260522", "00700.HK", shorter_runtime_snapshot)
+
+        cached = adapter.get_terminal_snapshot("20260522", "00700.HK")
+        minute_record = json.loads(redis.values["terminal:20260522:minute:00700.HK"])
+        self.assertEqual([bar["timestamp"] for bar in cached["minute_bars"]], [
+            "2026-05-22T09:30:00+08:00",
+            "2026-05-22T09:31:00+08:00",
+            "2026-05-22T09:32:00+08:00",
+        ])
+        self.assertEqual(cached["snapshot"]["price"], 389.0)
+        self.assertEqual([bar["timestamp"] for bar in minute_record["data"]], [
+            "2026-05-22T09:30:00+08:00",
+            "2026-05-22T09:31:00+08:00",
+            "2026-05-22T09:32:00+08:00",
+        ])
 
     def test_redis_adapter_writes_explicit_symbol_runtime_state(self) -> None:
         redis = FakeRedisWithPipeline()
@@ -311,6 +391,49 @@ class FakeKafkaConsumer:
 
     def high_watermark(self, topic: str) -> int:
         return self.high_watermark_value
+
+
+class FakeConfluentKafkaMessage:
+    def __init__(self, *, topic: str, key: bytes, value: bytes, offset: int, partition: int) -> None:
+        self._topic = topic
+        self._key = key
+        self._value = value
+        self._offset = offset
+        self._partition = partition
+
+    def error(self):
+        return None
+
+    def topic(self):
+        return self._topic
+
+    def key(self):
+        return self._key
+
+    def value(self):
+        return self._value
+
+    def offset(self):
+        return self._offset
+
+    def partition(self):
+        return self._partition
+
+
+class FakeConfluentKafkaConsumer:
+    def __init__(self, messages: list[FakeConfluentKafkaMessage]) -> None:
+        self.messages = list(messages)
+        self.subscriptions = []
+        self.commit_count = 0
+
+    def subscribe(self, topics: list[str]) -> None:
+        self.subscriptions.append(topics)
+
+    def poll(self, timeout: float):
+        return self.messages.pop(0) if self.messages else None
+
+    def commit(self, asynchronous: bool = False) -> None:
+        self.commit_count += 1
 
 
 class FakeRedis:

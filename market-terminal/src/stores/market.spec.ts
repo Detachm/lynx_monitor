@@ -223,6 +223,45 @@ describe('market store', () => {
     })
   })
 
+  it('sorts and deduplicates snapshot minute bars with mixed timezone encodings', async () => {
+    const store = useMarketStore()
+    await store.subscribeSymbol('00700')
+
+    store.handleMessage({
+      type: 'snapshot',
+      symbol: '00700.HK',
+      snapshot: makeSnapshot('00700.HK', 388),
+      ticks: [
+        makeTick(388.8, '2026-05-22T09:32:05+08:00'),
+        makeTick(388.4, '2026-05-22T01:30:10Z'),
+        makeTick(388.6, '2026-05-22T09:31:45+08:00'),
+        makeTick(388.5, '2026-05-22T09:30:25+08:00'),
+      ],
+      alerts: [],
+      askQueues: [],
+      bidQueues: [],
+      holding: [],
+      freshness: {
+        updatedAt: '2026-05-22T09:32:00+08:00',
+        runtimeState: 'WARM',
+        degraded: false,
+        degradedReasons: [],
+        sourceDates: { minute_bars: '20260522' },
+      },
+    })
+
+    const ticks = store.symbols['00700.HK']!.ticks
+    expect(ticks.map((tick) => tick.timestamp)).toEqual([
+      '2026-05-22T09:30:00+08:00',
+      '2026-05-22T09:31:00+08:00',
+      '2026-05-22T09:32:00+08:00',
+    ])
+    expect(ticks[0]).toMatchObject({
+      price: 388.5,
+      volume: 2000,
+    })
+  })
+
   it('records frontend store update performance samples for shadow-run evidence', () => {
     const store = useMarketStore()
     const samples: MarketPerformanceSample[] = []

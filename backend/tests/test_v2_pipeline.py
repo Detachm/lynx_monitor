@@ -524,6 +524,30 @@ class BackendV2PipelineTest(unittest.TestCase):
             self.assertEqual(update.state["broker_queue"]["bid"][0]["brokerCode"], "UBS")
             self.assertEqual(update.state["freshness"]["source_dates"]["broker_queue"], "20260522")
 
+    def test_broker_queue_rolls_historical_snapshot_to_realtime_session(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_silver_tables(root)
+
+            bus = InMemoryEventBus()
+            octopus = OctopusComputeV2(MammothAPI(root), bus, InMemoryRedisSnapshotCache())
+            state = octopus.preload_bod(
+                "00700.HK",
+                "20260522",
+                cache_trade_date="20260525",
+                requested_trade_date="20260525",
+            )
+            raw_event = make_raw_broker_queue(bus)
+
+            update = octopus.apply_broker_queue_to_state(state, raw_event, "20260525")
+
+        self.assertEqual(update.state["snapshot"]["tradeDate"], "20260525")
+        self.assertEqual(update.state["snapshot"]["requestedTradeDate"], "20260525")
+        self.assertFalse(update.state["snapshot"]["isHistoricalSession"])
+        self.assertEqual(update.state["snapshot"]["volume"], 0)
+        self.assertEqual(update.state["minute_bars"], [])
+        self.assertEqual(update.state["freshness"]["effective_trade_date"], "20260525")
+
     def test_broker_queue_participant_display_uses_three_bucket_taxonomy(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -611,6 +635,28 @@ class BackendV2PipelineTest(unittest.TestCase):
             self.assertAlmostEqual(update.order_book["spread"], 0.3)
             self.assertEqual(update.state["l2_order_book"]["ask"][0]["volume"], 1000)
             self.assertEqual(update.state["freshness"]["source_dates"]["l2_order_book"], "20260522")
+
+    def test_l2_order_book_rolls_historical_snapshot_to_realtime_session(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_silver_tables(root)
+
+            bus = InMemoryEventBus()
+            octopus = OctopusComputeV2(MammothAPI(root), bus, InMemoryRedisSnapshotCache())
+            state = octopus.preload_bod(
+                "00700.HK",
+                "20260522",
+                cache_trade_date="20260525",
+                requested_trade_date="20260525",
+            )
+            raw_event = make_raw_l2_order_book(bus)
+
+            update = octopus.apply_l2_order_book_to_state(state, raw_event, "20260525")
+
+        self.assertEqual(update.state["snapshot"]["tradeDate"], "20260525")
+        self.assertFalse(update.state["snapshot"]["isHistoricalSession"])
+        self.assertEqual(update.state["snapshot"]["turnover"], 0.0)
+        self.assertEqual(update.state["freshness"]["source_dates"]["l2_order_book"], "20260525")
 
     def test_mammoth_quality_checks_reject_bad_silver_rows(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

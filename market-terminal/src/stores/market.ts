@@ -112,9 +112,6 @@ export const useMarketStore = defineStore('market', {
           this.health = health
         }) ?? null
 
-        await source.connect()
-        this.connectionStatus = 'connected'
-
         const persistedSymbols = this.subscribedSymbols.length > 0 ? [] : loadPersistedWatchlist()
         const defaultSymbols = sourceOptions.defaultSymbols?.length ? sourceOptions.defaultSymbols : DEFAULT_SYMBOLS
         const symbolsToSubscribe =
@@ -123,6 +120,13 @@ export const useMarketStore = defineStore('market', {
             : persistedSymbols.length > 0
               ? persistedSymbols
               : [...defaultSymbols]
+
+        for (const symbol of symbolsToSubscribe) {
+          this.stageSubscriptionSymbol(symbol)
+        }
+
+        await source.connect()
+        this.connectionStatus = 'connected'
 
         for (const symbol of symbolsToSubscribe) {
           try {
@@ -202,16 +206,32 @@ export const useMarketStore = defineStore('market', {
         } catch (error) {
           state.subscriptionStatus = 'degraded'
           state.subscriptionError = error instanceof Error ? error.message : String(error)
+          persistWatchlist(
+            this.subscribedSymbols.filter((item) => this.symbols[item]?.subscriptionStatus !== 'degraded'),
+          )
           throw error
         }
       } else if (state.snapshotLoaded) {
         setRuntimeStatusFromFreshness(state)
       }
 
-      if (!wasSubscribed) {
+      if (!wasSubscribed || this.connectionStatus === 'connected') {
         persistWatchlist(
           this.subscribedSymbols.filter((item) => this.symbols[item]?.subscriptionStatus !== 'degraded'),
         )
+      }
+    },
+
+    stageSubscriptionSymbol(rawSymbol: string) {
+      const symbol = normalizeStockSymbol(rawSymbol)
+      const state = this.ensureSymbol(symbol)
+      state.subscriptionStatus = 'loading'
+      state.subscriptionError = null
+      if (!this.activeSymbol) {
+        this.activeSymbol = symbol
+      }
+      if (!this.subscribedSymbols.includes(symbol)) {
+        this.subscribedSymbols.push(symbol)
       }
     },
 
@@ -271,7 +291,7 @@ export const useMarketStore = defineStore('market', {
         switch (message.type) {
           case 'snapshot':
             state.snapshot = message.snapshot
-            state.ticks = message.ticks.slice(-MAX_TICKS_PER_SYMBOL)
+            state.ticks = canonicalizeMinuteTicks(message.ticks)
             state.alerts = message.alerts.slice(0, MAX_ALERTS_PER_SYMBOL)
             state.askQueues = message.askQueues
             state.bidQueues = message.bidQueues
@@ -438,12 +458,32 @@ function upsertMinuteTick(existing: PriceTick[], tick: PriceTick): PriceTick[] {
     .slice(-MAX_TICKS_PER_SYMBOL)
 }
 
+function canonicalizeMinuteTicks(ticks: PriceTick[]): PriceTick[] {
+  return ticks.reduce<PriceTick[]>((merged, tick) => upsertMinuteTick(merged, tick), [])
+}
+
 function minuteBucket(timestamp: string): string {
-  const match = timestamp.match(/^(.+T\d{2}:\d{2}):\d{2}(?:\.\d+)?(.*)$/)
-  if (match) {
-    return `${match[1]}:00${match[2]}`
+  const normalizedInput = hasExplicitTimezone(timestamp) ? timestamp : `${timestamp}+08:00`
+  const parsed = new Date(normalizedInput)
+  if (!Number.isNaN(parsed.getTime())) {
+    return formatHongKongMinute(parsed)
   }
-  return timestamp
+  const match = timestamp.match(/^(.+T\d{2}:\d{2}):\d{2}(?:\.\d+)?(.*)$/)
+  return match ? `${match[1]}:00${match[2]}` : timestamp
+}
+
+function hasExplicitTimezone(timestamp: string): boolean {
+  return /(?:Z|[+-]\d{2}:\d{2})$/i.test(timestamp)
+}
+
+function formatHongKongMinute(date: Date): string {
+  const shifted = new Date(date.getTime() + 8 * 60 * 60 * 1000)
+  const year = shifted.getUTCFullYear()
+  const month = String(shifted.getUTCMonth() + 1).padStart(2, '0')
+  const day = String(shifted.getUTCDate()).padStart(2, '0')
+  const hour = String(shifted.getUTCHours()).padStart(2, '0')
+  const minute = String(shifted.getUTCMinutes()).padStart(2, '0')
+  return `${year}-${month}-${day}T${hour}:${minute}:00+08:00`
 }
 
 function loadPersistedWatchlist(): StockSymbol[] {

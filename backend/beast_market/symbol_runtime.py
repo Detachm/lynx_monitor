@@ -2,13 +2,15 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 import threading
 import time
 from typing import Any, Callable, Protocol
 
 from .contracts import make_terminal_message, now_iso, validate_processed_market_event
+
+HK_TZ = timezone(timedelta(hours=8))
 
 
 class SymbolRuntimeState(str, Enum):
@@ -112,6 +114,7 @@ class SymbolRuntimeManager:
         snapshot_sink: RuntimeSnapshotSink | None = None,
         raw_event_processor: RawEventProcessor | None = None,
         hydration_service: HistoricalHydrationService | None = None,
+        active_pool_manager: Any | None = None,
         eviction_grace_seconds: float = 300,
         max_concurrent_hydrations: int = 8,
         now: Clock | None = None,
@@ -127,6 +130,7 @@ class SymbolRuntimeManager:
         self.snapshot_sink = snapshot_sink
         self.raw_event_processor = raw_event_processor
         self.hydration_service = hydration_service or HistoricalHydrationService()
+        self.active_pool_manager = active_pool_manager
         self.eviction_grace_seconds = eviction_grace_seconds
         self.max_concurrent_hydrations = max_concurrent_hydrations
         self.now = now or time.monotonic
@@ -149,6 +153,7 @@ class SymbolRuntimeManager:
     def attach(self, symbol: str, subscriber_id: str) -> dict[str, Any]:
         state_payload: dict[str, Any] | None = None
         snapshot_payload: dict[str, Any] | None = None
+        pool_change = self._note_query(symbol)
         with self._condition:
             runtime = self.runtimes.setdefault(symbol, SymbolRuntime(symbol=symbol))
             was_unreferenced = runtime.ref_count == 0
@@ -171,6 +176,7 @@ class SymbolRuntimeManager:
                     snapshot_payload = runtime.snapshot_payload
             self._publish_state(symbol, state_payload)
             self._publish_snapshot(symbol, snapshot_payload)
+            self._deactivate_pool_evictions(pool_change)
             return snapshot
         except Exception:
             failure_state_payload: dict[str, Any] | None = None
@@ -188,6 +194,38 @@ class SymbolRuntimeManager:
         with self._condition:
             runtime = self.runtimes.setdefault(symbol, SymbolRuntime(symbol=symbol))
             runtime.subscribers.discard(subscriber_id)
+            if runtime.ref_count == 0 and runtime.state != SymbolRuntimeState.COLD:
+                runtime.state = SymbolRuntimeState.EVICTING
+                runtime.eviction_started_at = self.now()
+            state_payload = self._runtime_state_payload_locked(runtime)
+        self._publish_state(symbol, state_payload)
+        return runtime
+
+    def activate_symbol(self, symbol: str, *, strict_realtime: bool = False) -> SymbolRuntime:
+        state_payload: dict[str, Any] | None = None
+        snapshot_payload: dict[str, Any] | None = None
+        with self._condition:
+            runtime = self.runtimes.setdefault(symbol, SymbolRuntime(symbol=symbol))
+        self._ensure_hydrated(runtime)
+        with self._condition:
+            if runtime.state == SymbolRuntimeState.EVICTING:
+                runtime.state = SymbolRuntimeState.WARM
+                runtime.eviction_started_at = None
+        self._attach_realtime(runtime, strict=strict_realtime)
+        with self._condition:
+            state_payload = self._runtime_state_payload_locked(runtime)
+            if isinstance(runtime.snapshot_payload, dict):
+                snapshot_payload = runtime.snapshot_payload
+        self._publish_state(symbol, state_payload)
+        self._publish_snapshot(symbol, snapshot_payload)
+        return runtime
+
+    def deactivate_symbol(self, symbol: str) -> SymbolRuntime | None:
+        state_payload: dict[str, Any] | None = None
+        with self._condition:
+            runtime = self.runtimes.get(symbol)
+            if runtime is None:
+                return None
             if runtime.ref_count == 0 and runtime.state != SymbolRuntimeState.COLD:
                 runtime.state = SymbolRuntimeState.EVICTING
                 runtime.eviction_started_at = self.now()
@@ -225,6 +263,7 @@ class SymbolRuntimeManager:
                 current = self.runtimes.get(symbol)
                 if current is runtime and runtime.state == SymbolRuntimeState.EVICTING and runtime.ref_count == 0:
                     del self.runtimes[symbol]
+                    self._release_temporary_pool_symbol(symbol)
                     evicted.append(symbol)
         return evicted
 
@@ -339,6 +378,11 @@ class SymbolRuntimeManager:
         if raw_processor is None:
             raise RuntimeError("runtime raw event processor is not configured")
         with self._condition:
+            runtime = self.runtimes.setdefault(symbol, SymbolRuntime(symbol=symbol))
+            needs_hydration = not isinstance(runtime.snapshot_payload, dict)
+        if needs_hydration:
+            self._ensure_hydrated(runtime)
+        with self._condition:
             runtime = self.runtimes.get(symbol)
             if runtime is None or not isinstance(runtime.snapshot_payload, dict):
                 raise RuntimeError(f"runtime snapshot must be hydrated before raw processing: {symbol}")
@@ -389,6 +433,20 @@ class SymbolRuntimeManager:
             if runtime is None or not isinstance(runtime.snapshot_payload, dict):
                 return None
             return runtime.snapshot_payload
+
+    def retain_existing_runtime(self, symbol: str, subscriber_id: str) -> bool:
+        state_payload: dict[str, Any] | None = None
+        with self._condition:
+            runtime = self.runtimes.get(symbol)
+            if runtime is None or runtime.snapshot_payload is None or not runtime.realtime_attached:
+                return False
+            runtime.subscribers.add(subscriber_id)
+            if runtime.state == SymbolRuntimeState.EVICTING:
+                runtime.state = SymbolRuntimeState.LIVE if runtime.realtime_attached else SymbolRuntimeState.WARM
+                runtime.eviction_started_at = None
+            state_payload = self._runtime_state_payload_locked(runtime)
+        self._publish_state(symbol, state_payload)
+        return True
 
     def runtime_state_payload(self, symbol: str) -> dict[str, Any] | None:
         with self._condition:
@@ -474,13 +532,37 @@ class SymbolRuntimeManager:
             return self.gateway.snapshot_message(runtime.symbol, runtime.snapshot_payload)
         return self.gateway.subscribe(runtime.symbol, self.trade_date)
 
+    def _note_query(self, symbol: str) -> Any | None:
+        if self.active_pool_manager is None:
+            return None
+        note_query = getattr(self.active_pool_manager, "note_query", None)
+        if not callable(note_query):
+            return None
+        return note_query(symbol)
+
+    def _deactivate_pool_evictions(self, pool_change: Any | None) -> None:
+        if pool_change is None:
+            return
+        evicted_symbols = getattr(pool_change, "evicted_symbols", None)
+        if not isinstance(evicted_symbols, list):
+            return
+        for evicted_symbol in evicted_symbols:
+            self.deactivate_symbol(str(evicted_symbol))
+
+    def _release_temporary_pool_symbol(self, symbol: str) -> None:
+        if self.active_pool_manager is None:
+            return
+        release_temporary = getattr(self.active_pool_manager, "release_temporary", None)
+        if callable(release_temporary):
+            release_temporary(symbol)
+
     def _update_freshness(self, runtime: SymbolRuntime, payload: dict[str, Any]) -> None:
         freshness = payload.get("freshness")
         if isinstance(freshness, dict):
             runtime.snapshot_payload["freshness"] = freshness
             self._sync_degraded_from_snapshot(runtime)
 
-    def _attach_realtime(self, runtime: SymbolRuntime) -> None:
+    def _attach_realtime(self, runtime: SymbolRuntime, *, strict: bool = False) -> None:
         if self.attach_realtime is None or runtime.realtime_attached:
             return
         try:
@@ -492,8 +574,11 @@ class SymbolRuntimeManager:
                 runtime.state = SymbolRuntimeState.LIVE
         except Exception as error:
             runtime.state = SymbolRuntimeState.DEGRADED
-            runtime.degraded_reasons = [str(error)]
-            raise
+            reason = f"realtime_attach_failed: {error}"
+            if reason not in runtime.degraded_reasons:
+                runtime.degraded_reasons = [*runtime.degraded_reasons, reason]
+            if strict:
+                raise
 
     def _release_realtime(self, runtime: SymbolRuntime) -> None:
         if self.release_symbol is None or not runtime.realtime_attached:
@@ -503,8 +588,9 @@ class SymbolRuntimeManager:
             runtime.realtime_attached = False
         except Exception as error:
             runtime.state = SymbolRuntimeState.DEGRADED
-            runtime.degraded_reasons = [str(error)]
-            raise
+            reason = f"realtime_release_failed: {error}"
+            if reason not in runtime.degraded_reasons:
+                runtime.degraded_reasons = [*runtime.degraded_reasons, reason]
 
     def _ensure_hydrated(self, runtime: SymbolRuntime) -> None:
         key = self._hydration_key(runtime)
@@ -795,7 +881,9 @@ def minute_bucket(timestamp: str) -> str:
         parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
     except ValueError:
         return timestamp
-    return parsed.replace(second=0, microsecond=0).isoformat()
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=HK_TZ)
+    return parsed.astimezone(HK_TZ).replace(second=0, microsecond=0).isoformat()
 
 
 def degraded_snapshot_payload(symbol: str, trade_date: str, reason: str) -> dict[str, Any]:

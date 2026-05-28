@@ -27,10 +27,10 @@ describe('data source runtime config', () => {
     },
   }
 
-  it('keeps mock as the default when no cutover gate is configured', () => {
+  it('uses live as the default when no cutover gate is configured', () => {
     const config = resolveDataSourceRuntimeConfig({})
 
-    expect(config.defaultMode).toBe('mock')
+    expect(config.defaultMode).toBe('live')
     expect(config.liveUrl).toBe('ws://127.0.0.1:9020/ws')
     expect(config.protocol).toBe('terminal-message-v1')
     expect(config.defaultSymbols).toEqual(['00700.HK', '00939.HK', '02643.HK', '00108.HK'])
@@ -68,7 +68,7 @@ describe('data source runtime config', () => {
     })
   })
 
-  it('selects live in auto mode only when cutover readiness allows frontend v2', () => {
+  it('selects live in auto mode regardless of cutover readiness', () => {
     expect(
       selectDefaultDataSourceMode('auto', {
         ...passingReadiness,
@@ -80,13 +80,13 @@ describe('data source runtime config', () => {
         ...passingReadiness,
         frontend_default_v2_allowed: false,
       }),
-    ).toBe('mock')
+    ).toBe('live')
 
     expect(
       selectDefaultDataSourceMode('auto', {
         frontend_default_v2_allowed: true,
       }),
-    ).toBe('mock')
+    ).toBe('live')
   })
 
   it('parses live websocket URL and cutover readiness from Vite env values', () => {
@@ -120,14 +120,26 @@ describe('data source runtime config', () => {
     })
   })
 
-  it('keeps mock when live config has a non-Gateway URL or invalid protocol', () => {
+  it('accepts standard websocket ports omitted behind TLS proxies', () => {
+    const config = resolveDataSourceRuntimeConfig({
+      VITE_MARKET_DATA_MODE: 'live',
+      VITE_MARKET_WS_URL: 'wss://gateway.internal/ws',
+      VITE_MARKET_PROTOCOL: 'terminal-message-v1',
+    })
+
+    expect(config.defaultMode).toBe('live')
+    expect(config.liveUrl).toBe('wss://gateway.internal/ws')
+    expect(config.validationErrors).toEqual([])
+  })
+
+  it('keeps live mode and records validation errors for non-Gateway URLs or invalid protocol', () => {
     const invalidUrl = resolveDataSourceRuntimeConfig({
       VITE_MARKET_DATA_MODE: 'live',
       VITE_MARKET_WS_URL: 'https://gateway.internal/ws',
       VITE_MARKET_PROTOCOL: 'terminal-message-v1',
     })
 
-    expect(invalidUrl.defaultMode).toBe('mock')
+    expect(invalidUrl.defaultMode).toBe('live')
     expect(invalidUrl.validationErrors).toEqual(['live_url_invalid'])
 
     const invalidProtocol = resolveDataSourceRuntimeConfig({
@@ -137,32 +149,32 @@ describe('data source runtime config', () => {
       VITE_MARKET_CUTOVER_READINESS: JSON.stringify(passingReadiness),
     })
 
-    expect(invalidProtocol.defaultMode).toBe('mock')
+    expect(invalidProtocol.defaultMode).toBe('live')
     expect(invalidProtocol.protocol).toBe('terminal-message-v1')
     expect(invalidProtocol.validationErrors).toEqual(['protocol_invalid'])
 
-    const missingPort = resolveDataSourceRuntimeConfig({
+    const wrongPath = resolveDataSourceRuntimeConfig({
       VITE_MARKET_DATA_MODE: 'live',
-      VITE_MARKET_WS_URL: 'wss://gateway.internal/ws',
+      VITE_MARKET_WS_URL: 'wss://gateway.internal/socket',
       VITE_MARKET_PROTOCOL: 'terminal-message-v1',
     })
 
-    expect(missingPort.defaultMode).toBe('mock')
-    expect(missingPort.validationErrors).toEqual(['live_url_invalid'])
+    expect(wrongPath.defaultMode).toBe('live')
+    expect(wrongPath.validationErrors).toEqual(['live_url_invalid'])
   })
 
-  it('records invalid live config even when default mode is mock', () => {
+  it('forces mock configuration to live and records invalid config', () => {
     const config = resolveDataSourceRuntimeConfig({
       VITE_MARKET_DATA_MODE: 'mock',
       VITE_MARKET_WS_URL: 'https://gateway.internal/ws',
       VITE_MARKET_PROTOCOL: 'legacy-message',
     })
 
-    expect(config.defaultMode).toBe('mock')
+    expect(config.defaultMode).toBe('live')
     expect(config.validationErrors).toEqual(['live_url_invalid', 'protocol_invalid'])
   })
 
-  it('keeps auto on mock when cutover readiness lacks audit fields', () => {
+  it('keeps auto on live when cutover readiness lacks audit fields', () => {
     expect(
       selectDefaultDataSourceMode('auto', {
         schema_version: 1,
@@ -170,21 +182,21 @@ describe('data source runtime config', () => {
         frontend_default_v2_allowed: true,
         accepted_report_ids: ['session-1'],
       }),
-    ).toBe('mock')
+    ).toBe('live')
 
     expect(
       selectDefaultDataSourceMode('auto', {
         ...passingReadiness,
         accepted_report_ids: ['session-1', 'session-1'],
       }),
-    ).toBe('mock')
+    ).toBe('live')
 
     expect(
       selectDefaultDataSourceMode('auto', {
         ...passingReadiness,
         blockers: ['shadow_run_reports_fail_default_cutover_policy'],
       }),
-    ).toBe('mock')
+    ).toBe('live')
 
     expect(
       selectDefaultDataSourceMode('auto', {
@@ -194,6 +206,6 @@ describe('data source runtime config', () => {
           min_session_duration_seconds: 60,
         },
       }),
-    ).toBe('mock')
+    ).toBe('live')
   })
 })

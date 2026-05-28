@@ -183,6 +183,56 @@ class WebSocketServerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(service.delivered_terminal_symbols, {"00700.HK"})
         self.assertIsNotNone(service.last_terminal_message_delivered_at)
 
+    async def test_broadcast_once_drops_slow_client_without_blocking_active_client(self) -> None:
+        bus = InMemoryEventBus()
+        cache = InMemoryRedisSnapshotCache()
+        snapshot = make_snapshot_payload("00700.HK", 388.4)
+        cache.set_terminal_snapshot("20260522", "00700.HK", snapshot)
+        service = GatewayV2WebSocketService(
+            GatewayV2SessionManager(GatewayV2(bus, cache), trade_date="20260522"),
+            send_timeout_seconds=0.01,
+        )
+        active = FakeWebSocket([])
+        slow = SlowSendWebSocket([])
+        service.clients["active"] = active
+        service.clients["slow"] = slow
+        service.manager.connect("active")
+        service.manager.connect("slow")
+        service.manager.handle_message("active", gateway_request("subscribe", symbol="00700.HK"))
+        service.manager.handle_message("slow", gateway_request("subscribe", symbol="00700.HK"))
+        await service.flush_client("active")
+
+        bus.publish(
+            PROCESSED_TOPIC,
+            "00700.HK",
+            make_processed_market_event(
+                result_type="snapshot",
+                symbol="00700.HK",
+                source="octopus",
+                seq=1,
+                payload={
+                    **snapshot,
+                    "minute_bars": [
+                        {
+                            "timestamp": "2026-05-22T09:30:00+08:00",
+                            "price": 389,
+                            "volume": 1,
+                            "turnover": 389,
+                            "direction": "up",
+                        }
+                    ],
+                },
+            ),
+        )
+
+        delivered = await service.broadcast_once()
+
+        self.assertEqual(delivered, 1)
+        self.assertEqual(json.loads(active.sent[-1])["type"], "tick_realtime")
+        self.assertNotIn("slow", service.clients)
+        self.assertNotIn("slow", service.manager.sessions)
+        self.assertEqual(service.failed_client_sends, 1)
+
     async def test_terminal_delivery_counter_ignores_health_and_errors(self) -> None:
         service = GatewayV2WebSocketService(
             GatewayV2SessionManager(GatewayV2(InMemoryEventBus(), InMemoryRedisSnapshotCache()), trade_date="20260522")
@@ -239,6 +289,12 @@ class FakeWebSocket:
         return self.incoming.pop(0)
 
     async def send(self, message: str) -> None:
+        self.sent.append(message)
+
+
+class SlowSendWebSocket(FakeWebSocket):
+    async def send(self, message: str) -> None:
+        await asyncio.sleep(1)
         self.sent.append(message)
 
 

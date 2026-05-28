@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "trade_date": "20260526",
+  "silver_root": "/absolute/path/to/mammoth-silver",
+  "runtime_state_root": "artifacts/runtime-state",
+  "gateway": {
+    "host": "0.0.0.0",
+    "port": 9020,
+    "path": "/ws"
+  },
+  "kafka": {
+    "raw_topic": "raw_market_events_v1",
+    "processed_topic": "processed_market_events_v1",
+    "consumer_group": "beast-terminal-v2",
+    "poll_timeout_ms": 1000,
+    "auto_offset_reset": "latest"
+  },
+  "redis": {
+    "terminal_ttl_seconds": 28800,
+    "history_ttl_seconds": 2592000
+  },
+  "runtime": {
+    "runtime_state_root": "artifacts/runtime-state",
+    "kafka_spool_dir": "artifacts/runtime-state/kafka-spool",
+    "raw_queue_max_size": 10000,
+    "client_queue_size": 100,
+    "kafka_retries": 3,
+    "symbol_eviction_grace_seconds": 300,
+    "max_concurrent_hydrations": 8,
+    "big_trade_volume_baseline_ratio": 0.0005,
+    "install_signal_handlers": true
+  },
+  "active_pool": {
+    "target_size": 200,
+    "pinned_max_size": 100,
+    "rank_window_days": 5,
+    "rank_metric": "avg_turnover",
+    "exclude_instrument_types": ["ETF", "WARRANT", "CBBC", "FUND", "BOND", "DERIVATIVE"],
+    "eviction_grace_seconds": 300
+  },
+  "freshness": {
+    "max_event_age_seconds": 60,
+    "max_queue_backlog": 1000
+  },
+  "production_clients": {
+    "duckdb_connection": true,
+    "kafka_producer": true,
+    "kafka_consumer": true,
+    "redis_client": true,
+    "market_data_client": true
+  }
+}

@@ -69,6 +69,7 @@ from .cutover import (
     write_runtime_health_verification,
 )
 from .freshness import FreshnessPolicy, SymbolFreshnessTracker
+from .active_pool import ActivePoolConfig, ActiveSymbolPoolManager, ActiveSymbolRank
 from .adapters import (
     BoundedRawEventQueue,
     EventPublishError,
@@ -88,6 +89,7 @@ from .mammoth_api import (
 )
 from .performance import PerformanceSla, evaluate_performance
 from .ops import (
+    ActivePoolOperationResult,
     FrontendPerformanceImportResult,
     HistoricalManifestGenerationResult,
     KafkaSpoolReplayResult,
@@ -108,8 +110,10 @@ from .ops import (
     build_multi_trader_smoke_workflows_template,
     clear_runtime_cache,
     clear_runtime_state,
+    explain_active_pool_symbol,
     finalize_multi_trader_smoke,
     finalize_shadow_run_cutover,
+    generate_active_pool,
     generate_required_historical_manifests,
     import_frontend_performance_samples,
     import_legacy_shadow_telemetry,
@@ -117,9 +121,12 @@ from .ops import (
     import_multi_trader_smoke_artifacts,
     inspect_multi_trader_smoke_readiness,
     package_multi_trader_smoke,
+    pin_active_pool_symbol,
     prepare_multi_trader_smoke,
     record_multi_trader_smoke_workflow,
     replay_kafka_spool,
+    unpin_active_pool_symbol,
+    validate_redis_read_model_coverage,
     verify_multi_trader_smoke_services,
 )
 from .runtime_state import RuntimeStateClearResult, RuntimeStatePaths, RuntimeStateStore, clear_runtime_state_files
@@ -141,6 +148,7 @@ from .runtime import (
     normalize_xtquant_callback,
     normalize_xtquant_tick,
 )
+from .xtquant_client import DeferredCallbackSink, XtQuantMarketDataClient, XtQuantMarketDataStats
 from .shadow_run import (
     FileBackedShadowRunRecorder,
     LegacyShadowTelemetryAdapter,
@@ -157,6 +165,10 @@ from .shadow_run import (
 )
 
 __all__ = [
+    "ActivePoolConfig",
+    "ActivePoolOperationResult",
+    "ActiveSymbolPoolManager",
+    "ActiveSymbolRank",
     "BoundedRawEventQueue",
     "BeastMarketRuntime",
     "BeastMarketRuntimeClients",
@@ -171,6 +183,7 @@ __all__ = [
     "DEFAULT_LEGACY_TOPIC_NAMES",
     "EvidenceBundlePaths",
     "DuckDBParquetSilverTableReader",
+    "DeferredCallbackSink",
     "EventPublishError",
     "FailingEventBus",
     "FileBackedSpool",
@@ -220,6 +233,8 @@ __all__ = [
     "TERMINAL_MESSAGE_TYPES",
     "TERMINAL_MESSAGE_PROTOCOL",
     "XtQuantSubscriptionManager",
+    "XtQuantMarketDataClient",
+    "XtQuantMarketDataStats",
     "make_processed_market_event",
     "make_raw_market_event",
     "make_terminal_message",
@@ -252,14 +267,19 @@ __all__ = [
     "clear_runtime_cache",
     "clear_runtime_state",
     "clear_runtime_state_files",
+    "explain_active_pool_symbol",
     "build_multi_trader_smoke_workflows_template",
     "MultiTraderSmokeFinalizeResult",
     "MultiTraderSmokePreparationResult",
     "MultiTraderSmokeServiceCheckResult",
     "generate_required_historical_manifests",
+    "generate_active_pool",
     "import_frontend_performance_samples",
     "import_legacy_shadow_telemetry",
     "replay_kafka_spool",
+    "pin_active_pool_symbol",
+    "unpin_active_pool_symbol",
+    "validate_redis_read_model_coverage",
     "install_runtime_signal_handlers",
     "legacy_retirement_evidence_from_artifacts",
     "finalize_shadow_run_cutover",

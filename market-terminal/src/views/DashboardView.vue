@@ -31,7 +31,7 @@ const historyRows = computed(() =>
 
 onMounted(() => {
   if (market.connectionStatus === 'disconnected') {
-    void market.initialize('live', dataSourceOptions)
+    void market.initialize(DEFAULT_DATA_SOURCE_CONFIG.defaultMode, dataSourceOptions)
   }
 })
 

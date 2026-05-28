@@ -1,0 +1,6 @@
+confluent-kafka
+redis
+duckdb
+pandas
+websockets
+pytest

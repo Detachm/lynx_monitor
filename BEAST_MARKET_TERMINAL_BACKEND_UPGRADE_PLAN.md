@@ -1,6 +1,6 @@
 # Beast 市场终端后续开发推进计划
 
-Status: authoritative roadmap and todo as of 2026-05-26.
+Status: authoritative roadmap and todo as of 2026-05-27.
 
 This document is the only active development roadmap for the market terminal. Architecture principles live in `docs/terminal-runtime-architecture-guidance.md`. Historical schema and wire contracts live in `docs/mammoth-silver-schema-v1.md` and `docs/market-event-contracts-v1.md`.
 Phase 6 LAN smoke execution is documented in `docs/lan-multi-trader-smoke-runbook.md`.
@@ -17,6 +17,9 @@ Phase 6 LAN smoke execution is documented in `docs/lan-multi-trader-smoke-runboo
 - Kafka 的 `raw_market_events_v1` 是 durable fact stream。
 - `processed_market_events_v1` 保留为 shadow/audit/downstream 可选链路，不再是 Gateway 唯一状态来源。
 - Redis 是 rebuildable read model，不是事实源。
+- 生产 runtime 采用 active-pool 模型：默认维护 200 只活跃正股，用户查询池外股票时进入 pinned/temporary 生命周期。
+- 当前外网访问形态是本地容器后端 + Vercel 前端 + Cloudflare quick tunnel；quick tunnel 是临时外网通道，不是稳定生产网络边界。
+- 交易日 realtime 首屏不得把上一有效日分钟 K 当作今日 K 线返回；非交易日可以展示上一有效交易日分钟 K，并在 freshness 中保留 requested/effective/source date evidence。
 
 必须坚持的边界：
 
@@ -78,6 +81,22 @@ Completed as of 2026-05-26:
 - Final multi-trader smoke verification now cross-checks Gateway observed client ids against observed/max client counters and rejects duplicate observed or declared client ids, so a hand-edited runtime health artifact cannot claim two real clients from one observed connection id.
 - Final multi-trader smoke verification preserves runtime health `generated_at` from the real-data runner or runtime-health verifier and rejects runtime health artifacts generated before this run's `prepared_at`, after the final observation time, or without a valid ISO timestamp.
 - Frontend live WebSocket requests carry the smoke `machine_id` as `client_id`; backend runtime health records `observed_declared_client_ids`, and final smoke verification requires those declared ids to cover every frontend client artifact machine id.
+
+Completed as of 2026-05-27:
+
+- Production backend container image and entrypoint run `beast_market.production_runtime` with verified config artifacts.
+- Runtime config now includes active-pool settings: `target_size`, `pinned_max_size`, `rank_window_days`, `rank_metric`, excluded instrument types, and eviction grace.
+- `ActiveSymbolPoolManager` maintains explicit active symbols, ranked base-active symbols, query-pinned symbols, temporary symbols, churn counters, and health evidence.
+- xtquant production client holds a persistent datacenter connection and subscribes active symbols to `hktransaction` and `hkbrokerqueueex`.
+- xtquant callbacks remain enqueue-only; realtime processing is bounded per tick so WebSocket handling is not starved under callback/Kafka backlog.
+- Production Kafka polling is short-polled through `KAFKA_POLL_TIMEOUT_MS=1`; health snapshot writes are less frequent to reduce hot-loop pressure.
+- Startup active symbols are promoted to today's realtime session on trading days even when same-day silver minute bars are unavailable.
+- Cold-query hydration now applies the same trading-day rollover before returning a first snapshot, so previous-day minute bars are not mixed with same-day realtime bars.
+- Non-trading requested dates still use latest effective-day silver minute bars and expose requested/effective/source date freshness.
+- Snapshots resolve display names from `silver_instruments_v1.name`; `00700.HK` displays as `腾讯控股` when instrument data is present.
+- Full-tick seeding after realtime attach can populate a same-day live snapshot quickly while normal callbacks continue the minute/queue read model.
+- Active-runtime subscribe fast path returns in-process `SymbolRuntime` snapshots without a full rehydrate.
+- Vercel deployment is frozen to `TerminalMessage v1` and build-time live settings; the current WebSocket URL must be redeployed when the Cloudflare quick tunnel URL changes.
 - Runtime health verification validates declared Gateway client id evidence shape, and final smoke verification rejects stale runtime health artifacts that omit declared client id fields entirely.
 - Final multi-trader smoke verification now requires Gateway WebSocket evidence with a non-loopback host, valid port, and `/ws` path, so LAN accessibility is enforced by the evidence gate.
 - Final multi-trader smoke verification rejects mock-mode frontend client artifacts; every client must export `data_source_mode: live`.
@@ -224,8 +243,9 @@ Closed-market / pre-open 默认规则：
 
 - Redis key 中的 `{date}` 使用 `requested_trade_date`。
 - payload/freshness 必须带 `requested_trade_date`、`effective_trade_date`、`source_dates`、`runtime_state`、`degraded_reasons`。
-- 非交易日或无今日有效数据时显示 latest effective trading day。
-- 交易日开盘前先显示 latest effective data，状态为 `WARM`；收到今日 realtime/1m 数据后切到今日 effective date。
+- 非交易日显示 latest effective trading day，包括上一有效交易日分钟 K，并在 freshness 中明确 requested/effective/source dates。
+- 交易日如果今日 1m silver 尚不可用但需要 attach realtime，首屏不得返回上一有效日分钟 K；runtime 先 rollover 到 requested date、清空历史分钟线，并在无法补齐盘中缺口时标记 `intraday_gap_before_attach`。
+- 收到今日 realtime/1m 数据后更新今日 minute read model。
 
 ### Redis / Kafka / Gateway
 

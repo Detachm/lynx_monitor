@@ -8,6 +8,7 @@ import {
 } from '@/services/webSocketDataSource'
 
 afterEach(() => {
+  vi.useRealTimers()
   vi.unstubAllGlobals()
 })
 
@@ -257,6 +258,67 @@ describe('WebSocketDataSource subscribe acknowledgements', () => {
       action: 'unsubscribe',
       symbol: '00700.HK',
     })
+  })
+
+  it('reconnects and restores desired subscriptions after an unexpected close', async () => {
+    vi.useFakeTimers()
+    const sockets = installFakeWebSocket()
+    const source = new WebSocketDataSource('ws://localhost:9020/ws', 'terminal-message-v1', 50, 'desk-a', 10, 100)
+    const connected = source.connect()
+    sockets[0]!.open()
+    await connected
+    const subscribed = source.subscribe('700')
+    sockets[0]!.message(snapshotFrame('00700.HK'))
+    await subscribed
+
+    sockets[0]!.close()
+    await vi.advanceTimersByTimeAsync(10)
+    expect(sockets).toHaveLength(2)
+    sockets[1]!.open()
+    await Promise.resolve()
+
+    expect(JSON.parse(sockets[1]!.sent[0]!)).toMatchObject({
+      action: 'subscribe',
+      symbol: '00700.HK',
+      client_id: 'desk-a',
+    })
+  })
+
+  it('allows subscribe before the websocket has opened', async () => {
+    const sockets = installFakeWebSocket()
+    const source = new WebSocketDataSource('ws://localhost:9020/ws', 'terminal-message-v1', 50, 'desk-a')
+
+    const subscribed = source.subscribe('700')
+    expect(sockets).toHaveLength(1)
+    expect(sockets[0]!.sent).toEqual([])
+
+    sockets[0]!.open()
+    await Promise.resolve()
+    expect(JSON.parse(sockets[0]!.sent[0]!)).toMatchObject({
+      action: 'subscribe',
+      symbol: '00700.HK',
+      client_id: 'desk-a',
+    })
+
+    sockets[0]!.message(snapshotFrame('00700.HK'))
+    await subscribed
+  })
+
+  it('does not reconnect after an explicit disconnect', async () => {
+    vi.useFakeTimers()
+    const sockets = installFakeWebSocket()
+    const source = new WebSocketDataSource('ws://localhost:9020/ws', 'terminal-message-v1', 50, 'desk-a', 10, 100)
+    const connected = source.connect()
+    sockets[0]!.open()
+    await connected
+    const subscribed = source.subscribe('700')
+    sockets[0]!.message(snapshotFrame('00700.HK'))
+    await subscribed
+
+    source.disconnect()
+    await vi.advanceTimersByTimeAsync(100)
+
+    expect(sockets).toHaveLength(1)
   })
 })
 

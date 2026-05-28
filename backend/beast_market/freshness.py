@@ -13,6 +13,7 @@ class SymbolFreshness:
     period: str | None = None
     stream_kind: str | None = None
     subscribed: bool = False
+    subscribed_at: str | None = None
     latest_event_at: str | None = None
     latest_ingest_at: str | None = None
     queue_backlog: int = 0
@@ -33,6 +34,7 @@ class SymbolFreshness:
             "stream_kind": self.stream_kind,
             "stream_id": self.stream_id,
             "subscribed": self.subscribed,
+            "subscribed_at": self.subscribed_at,
             "latest_event_at": self.latest_event_at,
             "latest_ingest_at": self.latest_ingest_at,
             "queue_backlog": self.queue_backlog,
@@ -62,6 +64,7 @@ class SymbolFreshnessTracker:
     ) -> SymbolFreshness:
         state = self._state(symbol, period=period, stream_kind=stream_kind)
         state.subscribed = True
+        state.subscribed_at = now_iso()
         state.resubscribe_requested = False
         state.degraded = False
         state.degraded_reason = None
@@ -76,6 +79,7 @@ class SymbolFreshnessTracker:
     ) -> SymbolFreshness:
         state = self._state(symbol, period=period, stream_kind=stream_kind)
         state.subscribed = False
+        state.subscribed_at = None
         state.resubscribe_requested = False
         state.degraded = False
         state.degraded_reason = None
@@ -91,6 +95,7 @@ class SymbolFreshnessTracker:
         stream_kind: str | None = None,
     ) -> SymbolFreshness:
         state = self._state(symbol, period=period, stream_kind=stream_kind)
+        self._inherit_subscription(symbol, state)
         state.latest_event_at = source_ts
         state.latest_ingest_at = ingest_ts or now_iso()
         state.degraded = False
@@ -107,6 +112,7 @@ class SymbolFreshnessTracker:
         stream_kind: str | None = None,
     ) -> SymbolFreshness:
         state = self._state(symbol, period=period, stream_kind=stream_kind)
+        self._inherit_subscription(symbol, state)
         state.queue_backlog = max(0, queue_backlog)
         return state
 
@@ -158,10 +164,20 @@ class SymbolFreshnessTracker:
             self.state_by_symbol[key] = SymbolFreshness(symbol=symbol, period=period, stream_kind=stream_kind)
         return self.state_by_symbol[key]
 
+    def _inherit_subscription(self, symbol: str, state: SymbolFreshness) -> None:
+        if state.subscribed:
+            return
+        parent = self.state_by_symbol.get(freshness_key(symbol))
+        if parent is not None and parent.subscribed:
+            state.subscribed = True
+            state.subscribed_at = parent.subscribed_at
+
     def _degraded_reason(self, state: SymbolFreshness, current: str) -> str | None:
         if state.queue_backlog > self.policy.max_queue_backlog:
             return "queue_backlog_exceeded"
         if not state.latest_event_at:
+            if state.subscribed_at and parse_ts(current) - parse_ts(state.subscribed_at) <= self.policy.max_event_age_seconds:
+                return None
             return "no_events_after_subscribe"
         if parse_ts(current) - parse_ts(state.latest_event_at) > self.policy.max_event_age_seconds:
             return "stale_event_stream"

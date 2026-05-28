@@ -12,9 +12,15 @@ from beast_market import (
     BeastMarketRuntimeSupervisor,
     DuckDBParquetSilverTableReader,
     FileBackedShadowRunRecorder,
+    InMemoryEventBus,
+    InMemoryRedisSnapshotCache,
     KafkaAdapterConfig,
+    MammothAPI,
+    OctopusComputeV2,
     RAW_TOPIC,
     RedisAdapterConfig,
+    DeferredCallbackSink,
+    XtQuantMarketDataClient,
     build_beast_market_runtime,
     clear_runtime_cache,
     evaluate_monitoring_historical_readiness,
@@ -25,7 +31,20 @@ from beast_market import (
     shadow_run_file_paths,
     write_runtime_health_snapshot,
 )
-from beast_market.app_runtime import hydrate_symbol_snapshot, is_terminal_snapshot_fresh, recover_symbol_intraday
+from beast_market.app_runtime import (
+    hydrate_symbol_snapshot,
+    is_terminal_snapshot_fresh,
+    recover_symbol_intraday,
+    promote_snapshot_to_realtime_session,
+    seed_symbol_from_market_full_tick,
+    should_attach_realtime_for_symbol,
+)
+from beast_market.production_runtime import (
+    ConfluentKafkaConsumerAdapter,
+    build_parser,
+    build_runtime_with_deferred_xtquant,
+    with_gateway_port,
+)
 
 
 class AppRuntimeTest(unittest.TestCase):
@@ -92,6 +111,117 @@ class AppRuntimeTest(unittest.TestCase):
 
             self.assertIsInstance(runtime.mammoth.reader, DuckDBParquetSilverTableReader)
             self.assertIs(runtime.mammoth.reader.connection, connection)
+
+    def test_build_runtime_with_deferred_xtquant_callback_sink_targets_ingest_queue(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            callback_sink = DeferredCallbackSink()
+            runtime = build_runtime_with_deferred_xtquant(
+                BeastMarketRuntimeConfig(
+                    trade_date="20260522",
+                    silver_root=root,
+                    runtime_state_root=root / "artifacts" / "runtime-state",
+                ),
+                BeastMarketRuntimeClients(
+                    kafka_producer=FakeKafkaProducer(),
+                    kafka_consumer=FakeKafkaConsumer(),
+                    redis_client=FakeRedis(),
+                    market_data_client=XtQuantMarketDataClient(callback_sink=callback_sink),
+                ),
+            )
+
+            accepted = callback_sink(
+                {
+                    "symbol": "00700.HK",
+                    "period": "hktransaction",
+                    "data": {"Price": 388.4, "Volume": 1000},
+                }
+            )
+
+            self.assertTrue(accepted)
+            self.assertEqual(runtime.raw_queue.backlog, 1)
+
+    def test_production_runtime_cli_exposes_validation_port_and_tick_limit(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "--config-path",
+                "runtime.json",
+                "--gateway-port",
+                "19020",
+                "--health-snapshot-interval-seconds",
+                "5",
+                "--max-ticks",
+                "3",
+            ]
+        )
+        config = BeastMarketRuntimeConfig(
+            trade_date="20260522",
+            silver_root="silver",
+            runtime_state_root="state",
+            gateway_port=9020,
+        )
+
+        updated = with_gateway_port(config, args.gateway_port)
+
+        self.assertEqual(args.max_ticks, 3)
+        self.assertEqual(args.health_snapshot_interval_seconds, 5)
+        self.assertEqual(updated.gateway_port, 19020)
+        self.assertEqual(config.gateway_port, 9020)
+
+    def test_confluent_consumer_adapter_keeps_raw_and_processed_subscriptions(self) -> None:
+        consumer = FakeConfluentConsumer()
+        adapter = ConfluentKafkaConsumerAdapter(consumer, FakeTopicPartition)
+
+        adapter.poll("raw_market_events_v1", 0, timeout_ms=0)
+        adapter.poll("processed_market_events_v1", 0, timeout_ms=0)
+
+        self.assertEqual(
+            consumer.subscriptions,
+            [["raw_market_events_v1"], ["processed_market_events_v1", "raw_market_events_v1"]],
+        )
+
+    def test_confluent_consumer_adapter_buffers_cross_topic_records(self) -> None:
+        consumer = FakeConfluentConsumer(
+            messages=[
+                FakeConfluentMessage(
+                    topic="raw_market_events_v1",
+                    key=b"00700.HK",
+                    value=b'{"symbol":"00700.HK"}',
+                    offset=4,
+                )
+            ]
+        )
+        adapter = ConfluentKafkaConsumerAdapter(consumer, FakeTopicPartition)
+
+        processed = adapter.poll("processed_market_events_v1", 0, timeout_ms=0)
+        raw = adapter.poll("raw_market_events_v1", 0, timeout_ms=0)
+
+        self.assertEqual(processed, [])
+        self.assertEqual(raw[0]["key"], b"00700.HK")
+        self.assertEqual(raw[0]["offset"], 4)
+
+    def test_confluent_consumer_adapter_polls_available_records_as_batch(self) -> None:
+        consumer = FakeConfluentConsumer(
+            messages=[
+                FakeConfluentMessage(topic="raw_market_events_v1", key=b"00700.HK", value=b"{}", offset=1),
+                FakeConfluentMessage(topic="raw_market_events_v1", key=b"00700.HK", value=b"{}", offset=2),
+                FakeConfluentMessage(topic="raw_market_events_v1", key=b"00700.HK", value=b"{}", offset=3),
+            ]
+        )
+        adapter = ConfluentKafkaConsumerAdapter(consumer, FakeTopicPartition, max_poll_records=2)
+
+        records = adapter.poll("raw_market_events_v1", 0, timeout_ms=0)
+
+        self.assertEqual([record["offset"] for record in records], [1, 2])
+
+    def test_confluent_consumer_adapter_commits_explicit_topic_offset(self) -> None:
+        consumer = FakeConfluentConsumer()
+        adapter = ConfluentKafkaConsumerAdapter(consumer, FakeTopicPartition)
+
+        adapter.commit("raw_market_events_v1", 42)
+
+        self.assertEqual(consumer.committed_offsets[0].topic, "raw_market_events_v1")
+        self.assertEqual(consumer.committed_offsets[0].offset, 42)
 
     def test_runtime_defaults_bind_gateway_for_lan_access(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -786,6 +916,152 @@ class AppRuntimeTest(unittest.TestCase):
             self.assertEqual(runtime.subscription_manager.stats.starts, 1)
             self.assertEqual(runtime.subscription_manager.stats.stops, 1)
 
+    def test_supervisor_tick_without_limit_drains_all_available_raw_events(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_silver(root)
+            broker = FakeKafkaBroker()
+            runtime = build_beast_market_runtime(
+                BeastMarketRuntimeConfig(
+                    trade_date="20260522",
+                    silver_root=root,
+                    runtime_state_root=root / "artifacts" / "runtime-state",
+                    big_trade_volume_baseline_ratio=2.0,
+                ),
+                BeastMarketRuntimeClients(
+                    kafka_producer=broker,
+                    kafka_consumer=broker,
+                    redis_client=RecordingRedis(),
+                    market_data_client=FakeMarketDataClient(),
+                ),
+            )
+            supervisor = BeastMarketRuntimeSupervisor(runtime)
+            supervisor.start(["00700.HK"])
+            for index in range(7):
+                runtime.ingest_worker.receive_callback(
+                    {
+                        "code": "700",
+                        "timestamp": f"2026-05-22T09:3{index}:00+08:00",
+                        "price": 388.4 + index,
+                        "volume": 1000 + index,
+                        "turnover": (388.4 + index) * (1000 + index),
+                    }
+                )
+
+            result = asyncio.run(supervisor.tick_once(now="2026-05-22T09:40:00+08:00"))
+            supervisor.stop()
+
+        self.assertEqual(result["ingested_events"], 7)
+        self.assertEqual(result["processed_events"], 7)
+        self.assertEqual(broker.committed("raw_market_events_v1"), 7)
+
+    def test_runtime_owned_raw_commit_failure_does_not_drop_realtime_snapshot(self) -> None:
+        class CommitFailingBroker(FakeKafkaBroker):
+            def commit(self, topic: str, offset: int) -> None:
+                raise RuntimeError("commit failed")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_silver(root)
+            broker = CommitFailingBroker()
+            runtime = build_beast_market_runtime(
+                BeastMarketRuntimeConfig(
+                    trade_date="20260522",
+                    silver_root=root,
+                    runtime_state_root=root / "artifacts" / "runtime-state",
+                    big_trade_volume_baseline_ratio=2.0,
+                ),
+                BeastMarketRuntimeClients(
+                    kafka_producer=broker,
+                    kafka_consumer=broker,
+                    redis_client=RecordingRedis(),
+                    market_data_client=FakeMarketDataClient(),
+                ),
+            )
+            supervisor = BeastMarketRuntimeSupervisor(runtime)
+            supervisor.start(["00700.HK"])
+            runtime.ingest_worker.receive_callback(
+                {
+                    "code": "700",
+                    "timestamp": "2026-05-22T09:30:00+08:00",
+                    "price": 388.4,
+                    "volume": 1000,
+                    "turnover": 388400,
+                }
+            )
+
+            result = asyncio.run(supervisor.tick_once(now="2026-05-22T09:30:01+08:00"))
+            supervisor.stop()
+
+        self.assertEqual(result["ingested_events"], 1)
+        self.assertEqual(result["processed_events"], 1)
+        self.assertEqual(result["terminal_messages"][0]["type"], "tick_realtime")
+        self.assertEqual(runtime.raw_consumer_worker.stats.failed, 1)
+        self.assertIn(
+            "runtime_owned_raw_commit_failed",
+            runtime.raw_consumer_worker.stats.dead_letters[0].reason,
+        )
+
+    def test_supervisor_start_fails_fast_when_initial_realtime_subscribe_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_silver(root)
+            runtime = build_beast_market_runtime(
+                BeastMarketRuntimeConfig(
+                    trade_date="20260522",
+                    silver_root=root,
+                    runtime_state_root=root / "artifacts" / "runtime-state",
+                ),
+                BeastMarketRuntimeClients(
+                    kafka_producer=FakeKafkaProducer(),
+                    kafka_consumer=FakeKafkaConsumer(),
+                    redis_client=RecordingRedis(),
+                    market_data_client=FakeMarketDataClient(fail_on_subscribe=True),
+                ),
+            )
+            supervisor = BeastMarketRuntimeSupervisor(runtime)
+
+            with self.assertRaisesRegex(RuntimeError, "subscribe failed"):
+                supervisor.start(["00700.HK"])
+
+        self.assertEqual(supervisor.stats.runtime_state, "DEGRADED")
+        self.assertFalse(supervisor.running)
+
+    def test_optional_instruments_reader_errors_fall_back_to_symbol_name(self) -> None:
+        mammoth = MammothAPI(reader=InstrumentKeyErrorReader())
+        octopus = OctopusComputeV2(mammoth, InMemoryEventBus(), InMemoryRedisSnapshotCache())
+
+        snapshot = octopus.preload_bod("00700.HK", "20260522")
+
+        self.assertEqual(mammoth.get_instruments(), [])
+        self.assertEqual(snapshot["snapshot"]["name"], "00700.HK")
+
+    def test_subscription_manager_stop_clears_internal_subscription_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_silver(root)
+            market_data_client = FakeMarketDataClient()
+            runtime = build_beast_market_runtime(
+                BeastMarketRuntimeConfig(
+                    trade_date="20260522",
+                    silver_root=root,
+                    runtime_state_root=root / "artifacts" / "runtime-state",
+                ),
+                BeastMarketRuntimeClients(
+                    kafka_producer=FakeKafkaProducer(),
+                    kafka_consumer=FakeKafkaConsumer(),
+                    redis_client=RecordingRedis(),
+                    market_data_client=market_data_client,
+                ),
+            )
+            runtime.subscription_manager.start()
+            runtime.subscription_manager.subscribe("00700.HK")
+
+            runtime.subscription_manager.stop()
+
+        self.assertEqual(runtime.subscription_manager.subscribed_symbols, set())
+        self.assertEqual(market_data_client.subscribed_symbols, ["00700.HK"])
+
     def test_runtime_health_snapshot_captures_lag_freshness_workers_and_subscription_state(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -934,6 +1210,8 @@ class AppRuntimeTest(unittest.TestCase):
         self.assertEqual(persisted["gateway_websocket"]["accepted_protocol"], "terminal-message-v1")
         self.assertTrue(persisted["gateway_websocket"]["running"])
         self.assertEqual(persisted["gateway_websocket"]["connected_clients"], 0)
+        self.assertEqual(persisted["gateway_websocket"]["failed_client_sends"], 0)
+        self.assertGreater(persisted["gateway_websocket"]["send_timeout_seconds"], 0)
         self.assertEqual(persisted["gateway_activity"]["processed_records_consumed"], 0)
         self.assertEqual(persisted["gateway_activity"]["shadow_processed_records_drained"], 1)
         self.assertEqual(persisted["gateway_activity"]["direct_runtime_messages_emitted"], 1)
@@ -1397,8 +1675,187 @@ class AppRuntimeTest(unittest.TestCase):
 
         self.assertEqual(runtime.effective_trade_date_by_symbol, {"00700.HK": "20260522"})
         self.assertEqual(market_data_client.subscribed_symbols, ["00700.HK"])
-        self.assertEqual(snapshot["snapshot"]["tradeDate"], "20260522")
-        self.assertEqual(snapshot["freshness"]["runtime_state"], "WARM")
+        self.assertEqual(snapshot["snapshot"]["tradeDate"], "20260525")
+        self.assertEqual(snapshot["snapshot"]["requestedTradeDate"], "20260525")
+        self.assertFalse(snapshot["snapshot"]["isHistoricalSession"])
+        self.assertEqual(snapshot["minute_bars"], [])
+        self.assertEqual(snapshot["freshness"]["runtime_state"], "LIVE")
+        self.assertIn("intraday_gap_before_attach", snapshot["freshness"]["degraded_reasons"])
+
+    def test_cold_hydration_rolls_previous_session_to_today_before_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_silver(root)
+            write_table(
+                root / "silver_instruments_v1.csv",
+                [
+                    {
+                        "schema_version": 1,
+                        "symbol": "00700.HK",
+                        "name": "腾讯控股",
+                        "source": "fixture",
+                        "ingest_ts": "2026-05-25T00:00:00+08:00",
+                        "row_hash": "instrument-00700",
+                    }
+                ],
+            )
+            write_table(
+                root / "silver_trading_calendar_v1.csv",
+                [
+                    {
+                        "schema_version": 1,
+                        "market": "HK",
+                        "trade_date": "20260525",
+                        "is_trading_day": True,
+                        "source": "fixture",
+                        "ingest_ts": "2026-05-25T00:00:00+08:00",
+                        "row_hash": "calendar-open",
+                    }
+                ],
+            )
+            runtime = build_beast_market_runtime(
+                BeastMarketRuntimeConfig(
+                    trade_date="20260525",
+                    silver_root=root,
+                    runtime_state_root=root / "artifacts" / "runtime-state",
+                ),
+                BeastMarketRuntimeClients(
+                    kafka_producer=FakeKafkaProducer(),
+                    kafka_consumer=FakeKafkaConsumer(),
+                    redis_client=RecordingRedis(),
+                    market_data_client=FakeMarketDataClient(),
+                ),
+            )
+
+            snapshot = hydrate_symbol_snapshot(runtime, "00700.HK")
+
+        self.assertEqual(snapshot["snapshot"]["name"], "腾讯控股")
+        self.assertEqual(snapshot["snapshot"]["tradeDate"], "20260525")
+        self.assertFalse(snapshot["snapshot"]["isHistoricalSession"])
+        self.assertEqual(snapshot["minute_bars"], [])
+        self.assertEqual(snapshot["freshness"]["source_dates"]["minute_bars"], "")
+        self.assertIn("intraday_gap_before_attach", snapshot["freshness"]["degraded_reasons"])
+
+    def test_cold_hydration_seeds_realtime_minute_bar_from_full_tick(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_silver(root)
+            write_table(
+                root / "silver_trading_calendar_v1.csv",
+                [
+                    {
+                        "schema_version": 1,
+                        "market": "HK",
+                        "trade_date": "20260525",
+                        "is_trading_day": True,
+                        "source": "fixture",
+                        "ingest_ts": "2026-05-25T00:00:00+08:00",
+                        "row_hash": "calendar-open",
+                    }
+                ],
+            )
+            runtime = build_beast_market_runtime(
+                BeastMarketRuntimeConfig(
+                    trade_date="20260525",
+                    silver_root=root,
+                    runtime_state_root=root / "artifacts" / "runtime-state",
+                ),
+                BeastMarketRuntimeClients(
+                    kafka_producer=FakeKafkaProducer(),
+                    kafka_consumer=FakeKafkaConsumer(),
+                    redis_client=RecordingRedis(),
+                    market_data_client=FakeMarketDataClient(
+                        full_ticks={
+                            "00700.HK": {
+                                "timetag": "20260525 09:31:33.653",
+                                "lastPrice": 390.0,
+                                "volume": 12345,
+                                "amount": 4814550,
+                            }
+                        }
+                    ),
+                ),
+            )
+
+            snapshot = hydrate_symbol_snapshot(runtime, "00700.HK")
+
+        self.assertEqual(snapshot["snapshot"]["tradeDate"], "20260525")
+        self.assertEqual(snapshot["minute_bars"][0]["timestamp"], "2026-05-25T09:31:00+08:00")
+        self.assertEqual(snapshot["minute_bars"][0]["close"], 390.0)
+        self.assertEqual(snapshot["freshness"]["source_dates"]["minute_bars"], "20260525")
+        self.assertNotIn("intraday_gap_before_attach", snapshot["freshness"]["degraded_reasons"])
+
+    def test_attach_realtime_accepts_truthy_non_builtin_trading_day_value(self) -> None:
+        class TruthyTradingDay:
+            def __bool__(self) -> bool:
+                return True
+
+        class Mammoth:
+            def is_trading_day(self, trade_date: str, *, market: str = "HK") -> TruthyTradingDay:
+                self.args = (trade_date, market)
+                return TruthyTradingDay()
+
+        runtime = type(
+            "Runtime",
+            (),
+            {
+                "config": type("Config", (), {"trade_date": "20260527"})(),
+                "effective_trade_date_by_symbol": {"00700.HK": "20260526"},
+                "mammoth": Mammoth(),
+            },
+        )()
+
+        self.assertTrue(should_attach_realtime_for_symbol(runtime, "00700.HK"))
+        self.assertEqual(runtime.mammoth.args, ("20260527", "HK"))
+
+    def test_full_tick_seed_populates_today_snapshot_and_minute_bar(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_silver(root)
+            market_data_client = FakeMarketDataClient(
+                full_ticks={
+                    "00700.HK": {
+                        "timetag": "20260525 09:31:33.653",
+                        "lastPrice": 390.0,
+                        "open": 389.0,
+                        "high": 391.0,
+                        "low": 388.0,
+                        "volume": 12345,
+                        "amount": 4814550,
+                    }
+                }
+            )
+            runtime = build_beast_market_runtime(
+                BeastMarketRuntimeConfig(
+                    trade_date="20260525",
+                    silver_root=root,
+                    runtime_state_root=root / "artifacts" / "runtime-state",
+                ),
+                BeastMarketRuntimeClients(
+                    kafka_producer=FakeKafkaProducer(),
+                    kafka_consumer=FakeKafkaConsumer(),
+                    redis_client=RecordingRedis(),
+                    market_data_client=market_data_client,
+                ),
+            )
+            snapshot = runtime.octopus.preload_bod(
+                "00700.HK",
+                "20260522",
+                cache_trade_date="20260525",
+                requested_trade_date="20260525",
+            )
+            promote_snapshot_to_realtime_session(runtime, "00700.HK", snapshot)
+
+            processed = seed_symbol_from_market_full_tick(runtime, "00700.HK")
+            cached = runtime.cache.get_terminal_snapshot("20260525", "00700.HK")
+
+        self.assertEqual(processed[0]["result_type"], "snapshot")
+        self.assertEqual(cached["snapshot"]["tradeDate"], "20260525")
+        self.assertEqual(cached["snapshot"]["price"], 390.0)
+        self.assertEqual(cached["snapshot"]["volume"], 12345)
+        self.assertEqual(cached["minute_bars"][0]["timestamp"], "2026-05-25T09:31:00+08:00")
+        self.assertEqual(cached["minute_bars"][0]["close"], 390.0)
+        self.assertEqual(cached["freshness"]["runtime_state"], "LIVE")
 
     def test_running_runtime_subscribes_new_symbol_not_in_startup_watchlist(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1445,6 +1902,66 @@ class AppRuntimeTest(unittest.TestCase):
         self.assertEqual(runtime.symbol_runtime_manager.runtimes["00939.HK"].hydrate_count, 1)
         self.assertIn("00939.HK", market_data_client.subscribed_symbols)
         self.assertIn("terminal:20260522:snapshot:00939.HK", redis.values)
+
+    def test_subscribe_to_active_intraday_gap_runtime_retries_full_tick_seed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_silver(root)
+            write_table(
+                root / "silver_trading_calendar_v1.csv",
+                [
+                    {
+                        "schema_version": 1,
+                        "market": "HK",
+                        "trade_date": "20260525",
+                        "is_trading_day": True,
+                        "source": "fixture",
+                        "ingest_ts": "2026-05-25T00:00:00+08:00",
+                        "row_hash": "calendar-open",
+                    }
+                ],
+            )
+            market_data_client = FakeMarketDataClient()
+            runtime = build_beast_market_runtime(
+                BeastMarketRuntimeConfig(
+                    trade_date="20260525",
+                    silver_root=root,
+                    runtime_state_root=root / "artifacts" / "runtime-state",
+                ),
+                BeastMarketRuntimeClients(
+                    kafka_producer=FakeKafkaProducer(),
+                    kafka_consumer=FakeKafkaConsumer(),
+                    redis_client=RecordingRedis(),
+                    market_data_client=market_data_client,
+                ),
+            )
+            supervisor = BeastMarketRuntimeSupervisor(runtime)
+
+            supervisor.start(["00700.HK"])
+            market_data_client.full_ticks["00700.HK"] = {
+                "timetag": "20260525 09:32:01.000",
+                "lastPrice": 391.0,
+                "volume": 1000,
+                "amount": 391000,
+            }
+            runtime.session_manager.connect("client")
+            runtime.session_manager.flush("client")
+            runtime.session_manager.handle_message(
+                "client",
+                {
+                    "schema_version": 1,
+                    "protocol": "terminal-message-v1",
+                    "action": "subscribe",
+                    "symbol": "00700.HK",
+                },
+            )
+            messages = [json.loads(item) for item in runtime.session_manager.flush("client")]
+            supervisor.stop()
+
+        self.assertEqual(messages[0]["type"], "snapshot")
+        self.assertEqual(messages[0]["payload"]["minute_bars"][0]["timestamp"], "2026-05-25T09:32:00+08:00")
+        self.assertEqual(messages[0]["payload"]["freshness"]["source_dates"]["minute_bars"], "20260525")
+        self.assertNotIn("intraday_gap_before_attach", messages[0]["payload"]["freshness"]["degraded_reasons"])
 
     def test_run_supervised_runtime_owns_lifecycle_websocket_and_health_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1494,6 +2011,7 @@ class AppRuntimeTest(unittest.TestCase):
                     symbols=["00700.HK"],
                     tick_interval_seconds=0,
                     health_snapshot_path=health_path,
+                    health_snapshot_interval_seconds=1,
                     serve_factory=serve_factory,
                     shadow_recorder=shadow_recorder,
                     max_ticks=1,
@@ -1616,6 +2134,57 @@ class FakeKafkaConsumer:
         return 0
 
 
+class FakeConfluentConsumer:
+    def __init__(self, messages: list["FakeConfluentMessage"] | None = None) -> None:
+        self.subscriptions: list[list[str]] = []
+        self.messages = list(messages or [])
+        self.committed_offsets: list[FakeTopicPartition] = []
+
+    def subscribe(self, topics: list[str]) -> None:
+        self.subscriptions.append(list(topics))
+
+    def poll(self, timeout: float):
+        if not self.messages:
+            return None
+        return self.messages.pop(0)
+
+    def commit(self, offsets: list["FakeTopicPartition"] | None = None, asynchronous: bool = False) -> None:
+        self.committed_offsets.extend(offsets or [])
+
+    def get_watermark_offsets(self, partition, timeout: float, cached: bool) -> tuple[int, int]:
+        return (0, 0)
+
+
+class FakeTopicPartition:
+    def __init__(self, topic: str, partition: int, offset: int = 0) -> None:
+        self.topic = topic
+        self.partition = partition
+        self.offset = offset
+
+
+class FakeConfluentMessage:
+    def __init__(self, *, topic: str, key: bytes, value: bytes, offset: int) -> None:
+        self._topic = topic
+        self._key = key
+        self._value = value
+        self._offset = offset
+
+    def topic(self) -> str:
+        return self._topic
+
+    def key(self) -> bytes:
+        return self._key
+
+    def value(self) -> bytes:
+        return self._value
+
+    def offset(self) -> int:
+        return self._offset
+
+    def error(self):
+        return None
+
+
 class FakeRedis:
     def set(self, key: str, value: str, ex: int) -> None:
         pass
@@ -1629,11 +2198,13 @@ class FakeDuckDBConnection:
 
 
 class FakeMarketDataClient:
-    def __init__(self) -> None:
+    def __init__(self, full_ticks: dict[str, dict] | None = None, *, fail_on_subscribe: bool = False) -> None:
         self.started = False
         self.stopped = False
         self.subscribed_symbols: list[str] = []
         self.unsubscribed_symbols: list[str] = []
+        self.full_ticks = full_ticks or {}
+        self.fail_on_subscribe = fail_on_subscribe
 
     def start(self) -> None:
         self.started = True
@@ -1642,10 +2213,109 @@ class FakeMarketDataClient:
         self.stopped = True
 
     def subscribe(self, symbol: str) -> None:
+        if self.fail_on_subscribe:
+            raise RuntimeError("subscribe failed")
         self.subscribed_symbols.append(symbol)
 
     def unsubscribe(self, symbol: str) -> None:
         self.unsubscribed_symbols.append(symbol)
+
+    def get_full_ticks(self, symbols: list[str]) -> dict[str, dict]:
+        return {symbol: self.full_ticks[symbol] for symbol in symbols if symbol in self.full_ticks}
+
+
+class InstrumentKeyErrorReader:
+    def read_table(self, data_type: str) -> list[dict]:
+        rows = {
+            "daily_bars": [
+                {
+                    "schema_version": 1,
+                    "symbol": "00700.HK",
+                    "trade_date": "20260521",
+                    "open": 382,
+                    "high": 384,
+                    "low": 380,
+                    "close": 382,
+                    "volume": 2000,
+                    "turnover": 764000,
+                    "source": "fixture",
+                    "ingest_ts": "2026-05-21T00:00:00Z",
+                    "row_hash": "daily-previous",
+                },
+                {
+                    "schema_version": 1,
+                    "symbol": "00700.HK",
+                    "trade_date": "20260522",
+                    "open": 386,
+                    "high": 389,
+                    "low": 385,
+                    "close": 386.2,
+                    "volume": 1000,
+                    "turnover": 386200,
+                    "source": "fixture",
+                    "ingest_ts": "2026-05-22T00:00:00Z",
+                    "row_hash": "daily",
+                },
+            ],
+            "minute_bars": [
+                {
+                    "schema_version": 1,
+                    "symbol": "00700.HK",
+                    "trade_date": "20260522",
+                    "bar_ts": "2026-05-22T09:30:00+08:00",
+                    "open": 388.0,
+                    "high": 388.6,
+                    "low": 387.8,
+                    "close": 388.4,
+                    "volume": 1000,
+                    "turnover": 388400,
+                    "source": "fixture",
+                    "ingest_ts": "2026-05-22T09:31:00+08:00",
+                    "row_hash": "minute-1",
+                }
+            ],
+            "ccass_holdings": [
+                {
+                    "schema_version": 1,
+                    "symbol": "00700.HK",
+                    "trade_date": "20260521",
+                    "participant_id": "C00010",
+                    "participant_name": "JPMorgan",
+                    "shares": 900,
+                    "percent": 1.0,
+                    "change": 0,
+                    "source": "fixture",
+                    "ingest_ts": "2026-05-21T00:00:00Z",
+                    "row_hash": "holding-previous",
+                },
+                {
+                    "schema_version": 1,
+                    "symbol": "00700.HK",
+                    "trade_date": "20260522",
+                    "participant_id": "C00010",
+                    "participant_name": "JPMorgan",
+                    "shares": 1000,
+                    "percent": 1.1,
+                    "change": 10,
+                    "source": "fixture",
+                    "ingest_ts": "2026-05-22T00:00:00Z",
+                    "row_hash": "holding-current",
+                },
+            ],
+            "broker_queue": [],
+            "broker_mapping": [
+                {
+                    "schema_version": 1,
+                    "broker_code": "JPM",
+                    "participant_id": "C00010",
+                    "participant_name": "JPMorgan",
+                    "source": "fixture",
+                    "ingest_ts": "2026-05-22T00:00:00Z",
+                    "row_hash": "mapping",
+                }
+            ],
+        }
+        return list(rows[data_type])
 
 
 class FakeKafkaBroker:

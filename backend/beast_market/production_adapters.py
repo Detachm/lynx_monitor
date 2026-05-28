@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import json
 import inspect
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timedelta, timezone
 from time import perf_counter
 from typing import Any
 
@@ -20,6 +21,9 @@ from .adapters import (
 from .contracts import now_iso
 
 
+HK_TZ = timezone(timedelta(hours=8))
+
+
 @dataclass(frozen=True)
 class KafkaAdapterConfig:
     raw_topic: str = "raw_market_events_v1"
@@ -28,6 +32,7 @@ class KafkaAdapterConfig:
     poll_timeout_ms: int = 1000
     auto_offset_reset: str = "latest"
     delivery_timeout_seconds: float = 5.0
+    max_poll_records: int = 1000
 
 
 @dataclass(frozen=True)
@@ -42,7 +47,9 @@ class RedisWriteStats:
     failures: int = 0
     last_latency_ms: float = 0.0
     max_latency_ms: float = 0.0
+    p95_latency_ms: float = 0.0
     last_error: str = ""
+    latency_ms: list[float] = field(default_factory=list)
 
 
 class KafkaEventBusAdapter:
@@ -58,6 +65,7 @@ class KafkaEventBusAdapter:
         self.consumer = consumer
         self.config = config or KafkaAdapterConfig()
         self._committed_offsets: dict[str, int] = {}
+        self._subscribed_topics: set[str] = set()
 
     def publish(self, topic: str, key: str, value: dict[str, Any]) -> None:
         validate_event_bus_publish_inputs(topic, key, value)
@@ -94,21 +102,37 @@ class KafkaEventBusAdapter:
         poll = getattr(self.consumer, "poll", None)
         if not callable(poll):
             return []
-        records = poll(topic=topic, offset=offset, timeout_ms=self.config.poll_timeout_ms)
-        return [
-            {
-                "key": decode_key(record.get("key")),
-                "value": decode_value(record.get("value")),
-                "offset": int(record.get("offset", offset + index)),
-            }
-            for index, record in enumerate(records or [])
-        ]
+        if consumer_accepts_topic_offset_poll(poll):
+            records = poll(topic=topic, offset=offset, timeout_ms=self.config.poll_timeout_ms)
+            return [
+                {
+                    "key": decode_key(record.get("key")),
+                    "value": decode_value(record.get("value")),
+                    "offset": int(record.get("offset", offset + index)),
+                }
+                for index, record in enumerate(records or [])
+            ]
+        self._ensure_subscribed(topic)
+        records = []
+        timeout_seconds = max(0.0, self.config.poll_timeout_ms / 1000)
+        for _ in range(self.config.max_poll_records):
+            message = poll(timeout_seconds)
+            if message is None:
+                break
+            normalized = normalize_kafka_message(message, topic)
+            if normalized is not None:
+                records.append(normalized)
+            timeout_seconds = 0.0
+        return records
 
     def commit(self, topic: str, offset: int) -> None:
         self._committed_offsets[topic] = offset
         commit = getattr(self.consumer, "commit", None) if self.consumer is not None else None
         if callable(commit):
-            commit(topic=topic, offset=offset)
+            if consumer_accepts_topic_offset_commit(commit):
+                commit(topic=topic, offset=offset)
+            else:
+                commit(asynchronous=False)
 
     def committed_offset(self, topic: str) -> int:
         if topic in self._committed_offsets:
@@ -124,6 +148,14 @@ class KafkaEventBusAdapter:
             return max(0, int(high_watermark(topic=topic)) - committed_offset)
         return 0
 
+    def _ensure_subscribed(self, topic: str) -> None:
+        if topic in self._subscribed_topics:
+            return
+        subscribe = getattr(self.consumer, "subscribe", None) if self.consumer is not None else None
+        if callable(subscribe):
+            subscribe([topic])
+        self._subscribed_topics.add(topic)
+
 
 class RedisSnapshotCacheAdapter:
     """Production-shaped Redis adapter for terminal snapshot keys."""
@@ -136,6 +168,11 @@ class RedisSnapshotCacheAdapter:
     def set_terminal_snapshot(self, trade_date: str, symbol: str, snapshot: dict[str, Any]) -> None:
         validate_snapshot_key_inputs(trade_date, symbol)
         ttl = self.config.terminal_ttl_seconds
+        snapshot = merge_existing_minute_bars(
+            trade_date,
+            snapshot,
+            self._get_existing_terminal_snapshot_for_merge(trade_date, symbol),
+        )
         updated_at = snapshot_updated_at(snapshot)
         self._set_many_json(
             [
@@ -194,6 +231,12 @@ class RedisSnapshotCacheAdapter:
         decoded = decode_redis_json(value)
         return decoded if isinstance(decoded, dict) else None
 
+    def _get_existing_terminal_snapshot_for_merge(self, trade_date: str, symbol: str) -> dict[str, Any] | None:
+        try:
+            return self.get_terminal_snapshot(trade_date, symbol)
+        except Exception:
+            return None
+
     def set_holding_history(self, symbol: str, participant_id: str, history: list[dict[str, Any]]) -> None:
         validate_snapshot_symbol(symbol)
         if not isinstance(participant_id, str) or not participant_id.strip():
@@ -238,6 +281,80 @@ class RedisSnapshotCacheAdapter:
             self.write_stats.writes += 1
             self.write_stats.last_latency_ms = latency_ms
             self.write_stats.max_latency_ms = max(self.write_stats.max_latency_ms, latency_ms)
+            self.write_stats.latency_ms.append(latency_ms)
+            if len(self.write_stats.latency_ms) > 500:
+                del self.write_stats.latency_ms[: len(self.write_stats.latency_ms) - 500]
+            self.write_stats.p95_latency_ms = percentile(self.write_stats.latency_ms, 95)
+
+
+def merge_existing_minute_bars(trade_date: str, snapshot: dict[str, Any], existing: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(existing, dict):
+        return snapshot
+    existing_current = snapshot_has_current_trade_date_minute_bars(existing, trade_date)
+    if not existing_current:
+        return snapshot
+    if not snapshot_is_current_realtime_session(snapshot, trade_date):
+        return existing
+    existing_bars = existing.get("minute_bars")
+    new_bars = snapshot.get("minute_bars")
+    if not isinstance(existing_bars, list) or not isinstance(new_bars, list):
+        return snapshot
+    if not existing_bars:
+        return snapshot
+
+    merged: dict[str, dict[str, Any]] = {}
+    for bar in existing_bars:
+        if isinstance(bar, dict):
+            bucket = minute_bar_bucket(bar)
+            if bucket:
+                merged[bucket] = {**bar, "timestamp": bucket}
+    for bar in new_bars:
+        if isinstance(bar, dict):
+            bucket = minute_bar_bucket(bar)
+            if bucket:
+                merged[bucket] = {**bar, "timestamp": bucket}
+    if not merged:
+        return snapshot
+
+    enriched = dict(snapshot)
+    enriched["minute_bars"] = [merged[key] for key in sorted(merged)]
+    freshness = dict(enriched.get("freshness") or {})
+    source_dates = dict(freshness.get("source_dates") or {})
+    source_dates["minute_bars"] = trade_date
+    freshness["source_dates"] = source_dates
+    enriched["freshness"] = freshness
+    return enriched
+
+
+def snapshot_has_current_trade_date_minute_bars(snapshot: dict[str, Any], trade_date: str) -> bool:
+    freshness = snapshot.get("freshness")
+    source_dates = freshness.get("source_dates") if isinstance(freshness, dict) else {}
+    return isinstance(source_dates, dict) and source_dates.get("minute_bars") == trade_date
+
+
+def snapshot_is_current_realtime_session(snapshot: dict[str, Any], trade_date: str) -> bool:
+    freshness = snapshot.get("freshness")
+    freshness = freshness if isinstance(freshness, dict) else {}
+    source_dates = freshness.get("source_dates")
+    source_dates = source_dates if isinstance(source_dates, dict) else {}
+    if source_dates.get("minute_bars") == trade_date or source_dates.get("realtime_session") == trade_date:
+        return True
+    inner = snapshot.get("snapshot")
+    inner = inner if isinstance(inner, dict) else {}
+    return inner.get("tradeDate") == trade_date and inner.get("isHistoricalSession") is False
+
+
+def minute_bar_bucket(bar: dict[str, Any]) -> str:
+    timestamp = str(bar.get("timestamp") or "")
+    if not timestamp:
+        return ""
+    try:
+        parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+    except ValueError:
+        return timestamp
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=HK_TZ)
+    return parsed.astimezone(HK_TZ).replace(second=0, microsecond=0).isoformat()
 
 
 def decode_key(value: Any) -> str:
@@ -253,6 +370,33 @@ def decode_value(value: Any) -> dict[str, Any]:
     if not isinstance(decoded, dict):
         raise ValueError("Kafka record value must decode to an object")
     return decoded
+
+
+def normalize_kafka_message(message: Any, expected_topic: str) -> dict[str, Any] | None:
+    error = call_if_present(message, "error")
+    if error is not None:
+        code = call_if_present(error, "code")
+        name = str(call_if_present(error, "name") or error)
+        if name.endswith("_PARTITION_EOF") or str(code) in {"-191"}:
+            return None
+        raise RuntimeError(f"Kafka consumer error: {error}")
+    topic = str(call_if_present(message, "topic") or expected_topic)
+    if topic != expected_topic:
+        return None
+    return {
+        "key": decode_key(call_if_present(message, "key")),
+        "value": decode_value(call_if_present(message, "value")),
+        "offset": int(call_if_present(message, "offset") or 0),
+        "partition": int(call_if_present(message, "partition") or 0),
+        "topic": topic,
+    }
+
+
+def call_if_present(value: Any, name: str) -> Any:
+    attribute = getattr(value, name, None)
+    if callable(attribute):
+        return attribute()
+    return attribute
 
 
 def decode_redis_json(value: Any) -> Any:
@@ -307,6 +451,37 @@ def delivery_callback_parameter(produce: Any) -> str | None:
     if any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()):
         return "on_delivery"
     return None
+
+
+def consumer_accepts_topic_offset_poll(poll: Any) -> bool:
+    try:
+        signature = inspect.signature(poll)
+    except (TypeError, ValueError):
+        return False
+    parameters = signature.parameters
+    return "topic" in parameters and "offset" in parameters
+
+
+def consumer_accepts_topic_offset_commit(commit: Any) -> bool:
+    try:
+        signature = inspect.signature(commit)
+    except (TypeError, ValueError):
+        return False
+    parameters = signature.parameters
+    return "topic" in parameters and "offset" in parameters
+
+
+def percentile(samples: list[float], percentile_value: float) -> float:
+    if not samples:
+        return 0.0
+    ordered = sorted(samples)
+    if len(ordered) == 1:
+        return ordered[0]
+    rank = (len(ordered) - 1) * percentile_value / 100
+    lower = int(rank)
+    upper = min(lower + 1, len(ordered) - 1)
+    weight = rank - lower
+    return ordered[lower] * (1 - weight) + ordered[upper] * weight
 
 
 def wait_for_delivery_callback(

@@ -130,6 +130,14 @@ SILVER_TABLES = {
 }
 
 OPTIONAL_SILVER_TABLES = {
+    "instruments": SilverTable(
+        "silver_instruments_v1",
+        (
+            "schema_version",
+            "symbol",
+        ),
+        ("symbol",),
+    ),
     "trading_calendar": SilverTable(
         "silver_trading_calendar_v1",
         (
@@ -161,6 +169,7 @@ class MammothAPI:
         if reader is None and silver_root is None:
             raise MammothAPIError("MammothAPI requires silver_root or reader")
         self.reader = reader or CsvSilverTableReader(Path(silver_root or ""))
+        self._participant_history_cache: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
 
     def get_daily_bars(self, symbol: str, start_date: str, end_date: str) -> list[dict[str, Any]]:
         rows = self._read_table("daily_bars")
@@ -169,6 +178,25 @@ class MammothAPI:
             for row in rows
             if row["symbol"] == symbol and start_date <= row["trade_date"] <= end_date
         ]
+
+    def get_all_daily_bars(self) -> list[dict[str, Any]]:
+        return list(self._read_table("daily_bars"))
+
+    def get_instruments(self) -> list[dict[str, Any]]:
+        try:
+            return list(self._read_table("instruments"))
+        except Exception:
+            return []
+
+    def get_instrument_name(self, symbol: str) -> str:
+        for row in self.get_instruments():
+            if str(row.get("symbol") or "") != symbol:
+                continue
+            for key in ("name", "short_name", "display_name", "chinese_name", "english_name"):
+                value = row.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+        return ""
 
     def get_recent_daily_bars(self, symbol: str, trade_date: str, days: int = 2) -> list[dict[str, Any]]:
         if days < 1:
@@ -300,13 +328,17 @@ class MammothAPI:
     ) -> list[dict[str, Any]]:
         if days < 1:
             raise MammothAPIError("days must be positive")
-        rows = [
-            row
-            for row in self._read_table("ccass_holdings")
-            if row["symbol"] == symbol and row["participant_id"] == participant_id
-            and (trade_date is None or row["trade_date"] <= trade_date)
-        ]
-        rows.sort(key=lambda row: row["trade_date"])
+        cache_key = (symbol, participant_id, trade_date or "")
+        rows = self._participant_history_cache.get(cache_key)
+        if rows is None:
+            rows = [
+                row
+                for row in self._read_table("ccass_holdings")
+                if row["symbol"] == symbol and row["participant_id"] == participant_id
+                and (trade_date is None or row["trade_date"] <= trade_date)
+            ]
+            rows.sort(key=lambda row: row["trade_date"])
+            self._participant_history_cache[cache_key] = rows
         return rows[-days:]
 
     def get_broker_queue(self, symbol: str, trade_date: str) -> list[dict[str, Any]]:
@@ -446,10 +478,14 @@ class CsvSilverTableReader:
 
     def __init__(self, silver_root: str | Path):
         self.silver_root = Path(silver_root)
+        self._table_cache: dict[str, list[dict[str, Any]]] = {}
 
     def read_table(self, data_type: str) -> list[dict[str, Any]]:
         if data_type not in ALL_SILVER_TABLES:
             raise MammothAPIError(f"unknown silver data type: {data_type}")
+        cached = self._table_cache.get(data_type)
+        if cached is not None:
+            return cached
         table = ALL_SILVER_TABLES[data_type]
         path = self.silver_root / f"{table.name}.csv"
         if not path.exists():
@@ -462,6 +498,7 @@ class CsvSilverTableReader:
         missing = [column for column in table.required_columns if column not in reader.fieldnames]
         if missing:
             raise MammothAPIError(f"{path.name} missing columns: {', '.join(missing)}")
+        self._table_cache[data_type] = rows
         return rows
 
 
@@ -478,10 +515,14 @@ class DuckDBParquetSilverTableReader:
         self.silver_root = Path(silver_root)
         self.connection = connection
         self.file_glob = file_glob
+        self._table_cache: dict[str, list[dict[str, Any]]] = {}
 
     def read_table(self, data_type: str) -> list[dict[str, Any]]:
         if data_type not in ALL_SILVER_TABLES:
             raise MammothAPIError(f"unknown silver data type: {data_type}")
+        cached = self._table_cache.get(data_type)
+        if cached is not None:
+            return cached
         table = ALL_SILVER_TABLES[data_type]
         path = str(self.silver_root / table.name / self.file_glob)
         sql = f"select * from read_parquet(?)"
@@ -490,7 +531,9 @@ class DuckDBParquetSilverTableReader:
         missing = [column for column in table.required_columns if column not in columns]
         if missing:
             raise MammothAPIError(f"{table.name} parquet missing columns: {', '.join(missing)}")
-        return [normalize_duckdb_row(dict(zip(columns, row))) for row in cursor.fetchall()]
+        rows = [normalize_duckdb_row(dict(zip(columns, row))) for row in cursor.fetchall()]
+        self._table_cache[data_type] = rows
+        return rows
 
 
 def normalize_row(row: dict[str, str]) -> dict[str, Any]:

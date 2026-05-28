@@ -324,6 +324,60 @@ class GatewayTransportTest(unittest.TestCase):
         self.assertEqual(runtime.state, SymbolRuntimeState.WARM)
         self.assertFalse(runtime.realtime_attached)
 
+    def test_symbol_runtime_returns_snapshot_and_degrades_when_realtime_attach_fails(self) -> None:
+        bus = InMemoryEventBus()
+        cache = InMemoryRedisSnapshotCache()
+        snapshot = make_snapshot_payload("00700.HK", 388.4)
+        cache.set_terminal_snapshot("20260525", "00700.HK", snapshot)
+        gateway = GatewayV2(bus, cache)
+        runtime_manager = SymbolRuntimeManager(
+            gateway,
+            trade_date="20260525",
+            hydrate_symbol=lambda symbol: snapshot,
+            attach_realtime=lambda symbol: (_ for _ in ()).throw(RuntimeError("xtquant down")),
+        )
+
+        message = runtime_manager.attach("00700.HK", "client")
+
+        runtime = runtime_manager.runtimes["00700.HK"]
+        self.assertEqual(message["type"], "snapshot")
+        self.assertEqual(message["payload"]["snapshot"]["price"], 388.4)
+        self.assertEqual(runtime.state, SymbolRuntimeState.DEGRADED)
+        self.assertFalse(runtime.realtime_attached)
+        self.assertIn("realtime_attach_failed: xtquant down", runtime.degraded_reasons)
+        self.assertEqual(runtime.ref_count, 1)
+
+    def test_symbol_runtime_release_failure_degrades_symbol_without_blocking_eviction_loop(self) -> None:
+        bus = InMemoryEventBus()
+        cache = InMemoryRedisSnapshotCache()
+        tencent_snapshot = make_snapshot_payload("00700.HK", 388.4)
+        bank_snapshot = make_snapshot_payload("00939.HK", 6.1)
+        cache.set_terminal_snapshot("20260522", "00700.HK", tencent_snapshot)
+        cache.set_terminal_snapshot("20260522", "00939.HK", bank_snapshot)
+        gateway = GatewayV2(bus, cache)
+        current = [1000.0]
+        runtime_manager = SymbolRuntimeManager(
+            gateway,
+            trade_date="20260522",
+            hydrate_symbol=lambda symbol: tencent_snapshot if symbol == "00700.HK" else bank_snapshot,
+            attach_realtime=lambda symbol: True,
+            release_symbol=lambda symbol: (_ for _ in ()).throw(RuntimeError("unsubscribe failed")) if symbol == "00700.HK" else None,
+            eviction_grace_seconds=10,
+            now=lambda: current[0],
+        )
+
+        runtime_manager.attach("00700.HK", "client")
+        runtime_manager.attach("00939.HK", "client")
+        runtime_manager.detach("00700.HK", "client")
+        runtime_manager.detach("00939.HK", "client")
+        current[0] = 1011.0
+
+        self.assertEqual(runtime_manager.evict_expired(), ["00939.HK"])
+        self.assertIn("00700.HK", runtime_manager.runtimes)
+        self.assertNotIn("00939.HK", runtime_manager.runtimes)
+        self.assertEqual(runtime_manager.runtimes["00700.HK"].state, SymbolRuntimeState.DEGRADED)
+        self.assertIn("realtime_release_failed: unsubscribe failed", runtime_manager.runtimes["00700.HK"].degraded_reasons)
+
     def test_symbol_runtime_snapshot_comes_from_hydrated_runtime_payload_not_gateway_cache(self) -> None:
         bus = InMemoryEventBus()
         cache = InMemoryRedisSnapshotCache()

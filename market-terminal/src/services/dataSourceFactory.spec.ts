@@ -23,4 +23,14 @@ describe('data source factory', () => {
 
     expect(source).toBeInstanceOf(WebSocketDataSource)
   })
+
+  it('forces mock mode requests to the live WebSocket data source', () => {
+    const source = createMarketDataSource('mock', {
+      liveUrl: 'wss://gateway.internal/ws',
+      protocol: 'terminal-message-v1',
+      validationErrors: [],
+    })
+
+    expect(source).toBeInstanceOf(WebSocketDataSource)
+  })
 })

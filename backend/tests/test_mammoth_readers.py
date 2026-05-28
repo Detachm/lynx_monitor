@@ -334,6 +334,47 @@ class MammothReaderTest(unittest.TestCase):
         self.assertEqual(rows[0]["trade_date"], "20260522")
         self.assertEqual(rows[0]["close"], 386.2)
 
+    def test_duckdb_parquet_reader_caches_loaded_tables(self) -> None:
+        connection = FakeDuckDBConnection(
+            columns=[
+                "schema_version",
+                "symbol",
+                "trade_date",
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+                "turnover",
+                "source",
+                "ingest_ts",
+                "row_hash",
+            ],
+            rows=[
+                (
+                    1,
+                    "00700.HK",
+                    20260522,
+                    386.8,
+                    389.0,
+                    385.4,
+                    386.2,
+                    1000,
+                    386200,
+                    "mammoth",
+                    "2026-05-22T00:00:00Z",
+                    "daily-1",
+                )
+            ],
+        )
+        reader = DuckDBParquetSilverTableReader("/silver", connection)
+
+        initial_rows = reader.read_table("daily_bars")
+        repeated_rows = reader.read_table("daily_bars")
+
+        self.assertIs(initial_rows, repeated_rows)
+        self.assertEqual(connection.execute_calls, 1)
+
     def test_duckdb_parquet_reader_rejects_missing_required_columns(self) -> None:
         api = MammothAPI(reader=DuckDBParquetSilverTableReader("/silver", FakeDuckDBConnection(columns=["symbol"], rows=[])))
 
@@ -461,8 +502,10 @@ class FakeDuckDBConnection:
         self.rows = rows
         self.executed_sql = ""
         self.executed_params = []
+        self.execute_calls = 0
 
     def execute(self, sql: str, params: list[str]):
+        self.execute_calls += 1
         self.executed_sql = sql
         self.executed_params = params
         return self
