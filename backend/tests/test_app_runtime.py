@@ -1251,7 +1251,6 @@ class AppRuntimeTest(unittest.TestCase):
                     }
                 ],
             )
-            write_ccass(root)
             runtime = build_beast_market_runtime(
                 BeastMarketRuntimeConfig(
                     trade_date="20260522",
@@ -1279,6 +1278,51 @@ class AppRuntimeTest(unittest.TestCase):
             self.assertIn("missing_broker_mapping", readiness["blockers"])
             with self.assertRaisesRegex(RuntimeError, "historical data not ready"):
                 BeastMarketRuntimeSupervisor(runtime).start(["00700.HK"])
+
+    def test_historical_readiness_allows_current_only_ccass_for_new_listing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_minimal_silver(root)
+            write_table(
+                root / "silver_ccass_holdings_v1.csv",
+                [
+                    {
+                        "schema_version": 1,
+                        "symbol": "00700.HK",
+                        "trade_date": "20260522",
+                        "participant_id": "C00010",
+                        "participant_name": "JPMorgan",
+                        "shares": 1000,
+                        "percent": 1.1,
+                        "source": "fixture",
+                        "ingest_ts": "2026-05-22T00:00:00Z",
+                        "row_hash": "holding-current-only",
+                    }
+                ],
+            )
+            runtime = build_beast_market_runtime(
+                BeastMarketRuntimeConfig(
+                    trade_date="20260522",
+                    silver_root=root,
+                    runtime_state_root=root / "artifacts" / "runtime-state",
+                ),
+                BeastMarketRuntimeClients(
+                    kafka_producer=FakeKafkaProducer(),
+                    kafka_consumer=FakeKafkaConsumer(),
+                    redis_client=RecordingRedis(),
+                    market_data_client=FakeMarketDataClient(),
+                ),
+            )
+
+            readiness = evaluate_monitoring_historical_readiness(
+                runtime.mammoth,
+                symbols=["00700.HK"],
+                trade_date="20260522",
+            )
+
+        self.assertTrue(readiness["passed"])
+        self.assertEqual(readiness["blockers"], [])
+        self.assertTrue(readiness["evidence"]["ccass_holdings"]["00700.HK"]["previous_missing"])
 
     def test_historical_readiness_accepts_closed_day_minute_bars_from_effective_trade_date(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1327,6 +1371,20 @@ class AppRuntimeTest(unittest.TestCase):
                         "source": "fixture",
                         "ingest_ts": "2026-05-25T09:30:01+08:00",
                         "row_hash": "tick-only-20260525",
+                    }
+                ],
+            )
+            write_table(
+                root / "silver_trading_calendar_v1.csv",
+                [
+                    {
+                        "schema_version": 1,
+                        "market": "HK",
+                        "trade_date": "20260525",
+                        "is_trading_day": False,
+                        "source": "fixture",
+                        "ingest_ts": "2026-05-25T00:00:00+08:00",
+                        "row_hash": "calendar-closed",
                     }
                 ],
             )
@@ -1604,6 +1662,20 @@ class AppRuntimeTest(unittest.TestCase):
                     },
                 ],
             )
+            write_table(
+                root / "silver_trading_calendar_v1.csv",
+                [
+                    {
+                        "schema_version": 1,
+                        "market": "HK",
+                        "trade_date": "20260525",
+                        "is_trading_day": False,
+                        "source": "fixture",
+                        "ingest_ts": "2026-05-25T00:00:00+08:00",
+                        "row_hash": "calendar-closed",
+                    }
+                ],
+            )
             runtime = build_beast_market_runtime(
                 BeastMarketRuntimeConfig(
                     trade_date="20260525",
@@ -1807,6 +1879,25 @@ class AppRuntimeTest(unittest.TestCase):
 
         self.assertTrue(should_attach_realtime_for_symbol(runtime, "00700.HK"))
         self.assertEqual(runtime.mammoth.args, ("20260527", "HK"))
+
+    def test_attach_realtime_when_requested_trade_date_calendar_is_unknown(self) -> None:
+        class Mammoth:
+            def is_trading_day(self, trade_date: str, *, market: str = "HK") -> None:
+                self.args = (trade_date, market)
+                return None
+
+        runtime = type(
+            "Runtime",
+            (),
+            {
+                "config": type("Config", (), {"trade_date": "20260602"})(),
+                "effective_trade_date_by_symbol": {"00700.HK": "20260601"},
+                "mammoth": Mammoth(),
+            },
+        )()
+
+        self.assertTrue(should_attach_realtime_for_symbol(runtime, "00700.HK"))
+        self.assertEqual(runtime.mammoth.args, ("20260602", "HK"))
 
     def test_full_tick_seed_populates_today_snapshot_and_minute_bar(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

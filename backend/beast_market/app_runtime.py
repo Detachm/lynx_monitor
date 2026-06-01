@@ -760,8 +760,9 @@ def evaluate_monitoring_historical_readiness(
                 "previous_date": ccass_pair["previous_date"],
                 "current_row_count": len(ccass_pair["current_rows"]),
                 "previous_row_count": len(ccass_pair["previous_rows"]),
+                "previous_missing": not ccass_pair["previous_rows"],
             }
-            if not ccass_pair["current_rows"] or not ccass_pair["previous_rows"]:
+            if not ccass_pair["current_rows"]:
                 missing_ccass_symbols.append(symbol)
         except Exception as error:
             evidence["ccass_holdings"][symbol] = {"error": str(error), "current_row_count": 0, "previous_row_count": 0}
@@ -817,7 +818,7 @@ def should_attach_realtime_for_symbol(runtime: BeastMarketRuntime, symbol: str) 
     if runtime.effective_trade_date_by_symbol.get(symbol, requested_trade_date) == requested_trade_date:
         return True
     trading_day = runtime.mammoth.is_trading_day(requested_trade_date, market="HK")
-    return bool(trading_day)
+    return True if trading_day is None else bool(trading_day)
 
 
 def promote_snapshot_to_realtime_session(runtime: BeastMarketRuntime, symbol: str, snapshot: dict[str, Any]) -> dict[str, Any]:

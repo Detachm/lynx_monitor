@@ -170,13 +170,14 @@ class MammothAPI:
             raise MammothAPIError("MammothAPI requires silver_root or reader")
         self.reader = reader or CsvSilverTableReader(Path(silver_root or ""))
         self._participant_history_cache: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+        self._rows_by_symbol_cache: dict[str, dict[str, list[dict[str, Any]]]] = {}
+        self._rows_by_symbol_date_cache: dict[str, dict[tuple[str, str], list[dict[str, Any]]]] = {}
 
     def get_daily_bars(self, symbol: str, start_date: str, end_date: str) -> list[dict[str, Any]]:
-        rows = self._read_table("daily_bars")
         return [
             row
-            for row in rows
-            if row["symbol"] == symbol and start_date <= row["trade_date"] <= end_date
+            for row in self._rows_for_symbol("daily_bars", symbol)
+            if start_date <= row["trade_date"] <= end_date
         ]
 
     def get_all_daily_bars(self) -> list[dict[str, Any]]:
@@ -203,8 +204,8 @@ class MammothAPI:
             raise MammothAPIError("days must be positive")
         rows = [
             row
-            for row in self._read_table("daily_bars")
-            if row["symbol"] == symbol and row["trade_date"] <= trade_date
+            for row in self._rows_for_symbol("daily_bars", symbol)
+            if row["trade_date"] <= trade_date
         ]
         rows.sort(key=lambda row: row["trade_date"])
         return rows[-days:]
@@ -212,8 +213,8 @@ class MammothAPI:
     def get_previous_daily_bar(self, symbol: str, trade_date: str) -> dict[str, Any] | None:
         rows = [
             row
-            for row in self._read_table("daily_bars")
-            if row["symbol"] == symbol and row["trade_date"] < trade_date
+            for row in self._rows_for_symbol("daily_bars", symbol)
+            if row["trade_date"] < trade_date
         ]
         if not rows:
             return None
@@ -221,18 +222,10 @@ class MammothAPI:
         return rows[-1]
 
     def get_trade_ticks(self, symbol: str, trade_date: str) -> list[dict[str, Any]]:
-        return [
-            row
-            for row in self._read_table("trade_ticks")
-            if row["symbol"] == symbol and row["trade_date"] == trade_date
-        ]
+        return list(self._rows_for_symbol_date("trade_ticks", symbol, trade_date))
 
     def get_minute_bars(self, symbol: str, trade_date: str) -> list[dict[str, Any]]:
-        rows = [
-            row
-            for row in self._read_table("minute_bars")
-            if row["symbol"] == symbol and row["trade_date"] == trade_date
-        ]
+        rows = list(self._rows_for_symbol_date("minute_bars", symbol, trade_date))
         rows.sort(key=lambda row: str(row["bar_ts"]))
         return rows
 
@@ -240,12 +233,12 @@ class MammothAPI:
         if min_minute_bars < 1:
             raise MammothAPIError("min_minute_bars must be positive")
         try:
-            minute_rows = self._read_table("minute_bars")
+            minute_rows = self._rows_for_symbol("minute_bars", symbol)
         except MammothAPIError:
             minute_rows = []
         minute_counts: dict[str, int] = {}
         for row in minute_rows:
-            if row["symbol"] == symbol and row["trade_date"] <= trade_date:
+            if row["trade_date"] <= trade_date:
                 row_trade_date = str(row["trade_date"])
                 minute_counts[row_trade_date] = minute_counts.get(row_trade_date, 0) + 1
         minute_dates = sorted(
@@ -260,8 +253,8 @@ class MammothAPI:
         daily_dates = sorted(
             {
                 str(row["trade_date"])
-                for row in self._read_table("daily_bars")
-                if row["symbol"] == symbol and row["trade_date"] <= trade_date
+                for row in self._rows_for_symbol("daily_bars", symbol)
+                if row["trade_date"] <= trade_date
             }
         )
         return daily_dates[-1] if daily_dates else ""
@@ -286,8 +279,8 @@ class MammothAPI:
     def get_latest_ccass_holdings(self, symbol: str, trade_date: str | None = None) -> list[dict[str, Any]]:
         rows = [
             row
-            for row in self._read_table("ccass_holdings")
-            if row["symbol"] == symbol and (trade_date is None or row["trade_date"] <= trade_date)
+            for row in self._rows_for_symbol("ccass_holdings", symbol)
+            if trade_date is None or row["trade_date"] <= trade_date
         ]
         if not rows:
             return []
@@ -297,8 +290,8 @@ class MammothAPI:
     def get_ccass_holding_pair(self, symbol: str, trade_date: str) -> dict[str, Any]:
         rows = [
             row
-            for row in self._read_table("ccass_holdings")
-            if row["symbol"] == symbol and row["trade_date"] <= trade_date
+            for row in self._rows_for_symbol("ccass_holdings", symbol)
+            if row["trade_date"] <= trade_date
         ]
         dates = sorted(set(str(row["trade_date"]) for row in rows))
         current_date = dates[-1] if dates else ""
@@ -333,8 +326,8 @@ class MammothAPI:
         if rows is None:
             rows = [
                 row
-                for row in self._read_table("ccass_holdings")
-                if row["symbol"] == symbol and row["participant_id"] == participant_id
+                for row in self._rows_for_symbol("ccass_holdings", symbol)
+                if row["participant_id"] == participant_id
                 and (trade_date is None or row["trade_date"] <= trade_date)
             ]
             rows.sort(key=lambda row: row["trade_date"])
@@ -342,11 +335,7 @@ class MammothAPI:
         return rows[-days:]
 
     def get_broker_queue(self, symbol: str, trade_date: str) -> list[dict[str, Any]]:
-        return [
-            row
-            for row in self._read_table("broker_queue")
-            if row["symbol"] == symbol and row["trade_date"] == trade_date
-        ]
+        return list(self._rows_for_symbol_date("broker_queue", symbol, trade_date))
 
     def get_broker_mapping(self) -> list[dict[str, Any]]:
         return self._read_table("broker_mapping")
@@ -463,6 +452,31 @@ class MammothAPI:
 
     def _read_table(self, data_type: str) -> list[dict[str, Any]]:
         return self.reader.read_table(data_type)
+
+    def _rows_for_symbol(self, data_type: str, symbol: str) -> list[dict[str, Any]]:
+        rows_by_symbol = self._rows_by_symbol_cache.get(data_type)
+        if rows_by_symbol is None:
+            rows_by_symbol = {}
+            for row in self._read_table(data_type):
+                row_symbol = str(row.get("symbol") or "")
+                if not row_symbol:
+                    continue
+                rows_by_symbol.setdefault(row_symbol, []).append(row)
+            self._rows_by_symbol_cache[data_type] = rows_by_symbol
+        return rows_by_symbol.get(symbol, [])
+
+    def _rows_for_symbol_date(self, data_type: str, symbol: str, trade_date: str) -> list[dict[str, Any]]:
+        rows_by_symbol_date = self._rows_by_symbol_date_cache.get(data_type)
+        if rows_by_symbol_date is None:
+            rows_by_symbol_date = {}
+            for row in self._read_table(data_type):
+                row_symbol = str(row.get("symbol") or "")
+                row_trade_date = str(row.get("trade_date") or "")
+                if not row_symbol or not row_trade_date:
+                    continue
+                rows_by_symbol_date.setdefault((row_symbol, row_trade_date), []).append(row)
+            self._rows_by_symbol_date_cache[data_type] = rows_by_symbol_date
+        return rows_by_symbol_date.get((symbol, trade_date), [])
 
 
 def source_data_type_for_manifest(data_type: str) -> str:
