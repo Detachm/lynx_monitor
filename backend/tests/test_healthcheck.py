@@ -65,6 +65,24 @@ class RuntimeHealthcheckTest(unittest.TestCase):
 
         self.assertTrue(result.healthy)
 
+    def test_kafka_degraded_is_allowed_unless_required(self) -> None:
+        now = datetime(2026, 5, 22, 1, 30, tzinfo=UTC)
+        payload = runtime_health_payload(now)
+        payload["kafka"] = {
+            "producer_degraded": True,
+            "consumer_degraded": True,
+            "producer_reason": "broker unavailable",
+            "consumer_reason": "broker unavailable",
+        }
+
+        allowed = evaluate_runtime_health_snapshot(payload, now=now)
+        required = evaluate_runtime_health_snapshot(payload, now=now, require_kafka=True)
+
+        self.assertTrue(allowed.healthy)
+        self.assertFalse(required.healthy)
+        self.assertIn("kafka_producer_degraded", required.blockers)
+        self.assertIn("kafka_consumer_degraded", required.blockers)
+
 
 def runtime_health_payload(generated_at: datetime) -> dict:
     return {

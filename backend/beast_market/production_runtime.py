@@ -3,10 +3,12 @@ from __future__ import annotations
 import argparse
 import asyncio
 import importlib
+import json
 from pathlib import Path
 import time
 from typing import Sequence
 
+from .contracts import now_iso
 from .app_runtime import (
     BeastMarketRuntimeClients,
     BeastMarketRuntimeConfig,
@@ -38,6 +40,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         kafka_bootstrap_servers=args.kafka_bootstrap_servers,
         redis_url=args.redis_url,
         kafka_config=config.kafka,
+        allow_kafka_degraded=args.allow_kafka_degraded,
+        kafka_degraded_spool_dir=args.kafka_degraded_spool_dir,
+        redis_maxmemory=args.redis_maxmemory,
+        redis_maxmemory_policy=args.redis_maxmemory_policy,
         enable_xtquant=not args.disable_xtquant,
         xtquant_sdk_path=args.xtquant_sdk_path,
         xtquant_data_home=args.xtquant_data_home,
@@ -68,6 +74,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--symbols", default="", help="Comma-separated BOD warm symbols, e.g. 00700.HK,00939.HK.")
     parser.add_argument("--kafka-bootstrap-servers", default="127.0.0.1:9092")
     parser.add_argument("--redis-url", default="redis://127.0.0.1:6379/0")
+    parser.add_argument("--allow-kafka-degraded", action="store_true", help="Continue serving from memory/Redis when Kafka metadata is unavailable.")
+    parser.add_argument("--kafka-degraded-spool-dir", default="", help="Directory for local Kafka-degraded audit JSONL.")
+    parser.add_argument("--redis-maxmemory", default="", help="Optional Redis maxmemory value, e.g. 1gb.")
+    parser.add_argument("--redis-maxmemory-policy", default="volatile-ttl")
     parser.add_argument("--gateway-host", default="", help="Optional override for the verified config gateway host.")
     parser.add_argument("--gateway-port", type=int, default=None, help="Optional override for the verified config gateway port.")
     parser.add_argument("--health-snapshot-path", default="artifacts/runtime-health.json")
@@ -98,6 +108,10 @@ def build_production_clients(
     kafka_bootstrap_servers: str,
     redis_url: str,
     kafka_config: KafkaAdapterConfig | None = None,
+    allow_kafka_degraded: bool = False,
+    kafka_degraded_spool_dir: str | Path | None = None,
+    redis_maxmemory: str = "",
+    redis_maxmemory_policy: str = "volatile-ttl",
     enable_xtquant: bool = True,
     xtquant_sdk_path: str | Path | None = DEFAULT_XTQUANT_SDK_PATH,
     xtquant_data_home: str | Path = Path("/home/hliu/xtbackend/.runtime/xtquant"),
@@ -110,6 +124,7 @@ def build_production_clients(
         raise RuntimeError("redis package is required to start the production runtime") from error
     try:
         from confluent_kafka import Consumer, Producer, TopicPartition
+        from confluent_kafka.admin import AdminClient
     except ImportError as error:
         raise RuntimeError("confluent-kafka package is required to start the production runtime") from error
 
@@ -123,6 +138,37 @@ def build_production_clients(
 
     callback_sink = DeferredCallbackSink()
     resolved_kafka = kafka_config or KafkaAdapterConfig()
+    redis_client = redis.Redis.from_url(redis_url)
+    configure_redis_limits(
+        redis_client,
+        maxmemory=redis_maxmemory,
+        maxmemory_policy=redis_maxmemory_policy,
+    )
+    redis_client.ping()
+
+    kafka_available, kafka_error = kafka_metadata_available(AdminClient, kafka_bootstrap_servers)
+    if not kafka_available:
+        if not allow_kafka_degraded:
+            raise RuntimeError(f"Kafka metadata unavailable at {kafka_bootstrap_servers}: {kafka_error}")
+        degraded_spool_dir = Path(kafka_degraded_spool_dir or "artifacts/runtime-state/kafka-spool")
+        return BeastMarketRuntimeClients(
+            kafka_producer=DegradedKafkaProducer(
+                degraded_spool_dir / "kafka-degraded-audit.jsonl",
+                reason=f"Kafka metadata unavailable at {kafka_bootstrap_servers}: {kafka_error}",
+            ),
+            kafka_consumer=UnavailableKafkaConsumer(reason=str(kafka_error)),
+            redis_client=redis_client,
+            duckdb_connection=duckdb_connection,
+            market_data_client=XtQuantMarketDataClient(
+                callback_sink=callback_sink,
+                sdk_path=xtquant_sdk_path,
+                data_home=xtquant_data_home,
+                port=xtquant_port,
+            )
+            if enable_xtquant
+            else None,
+        )
+
     consumer = Consumer(
         {
             "bootstrap.servers": kafka_bootstrap_servers,
@@ -132,9 +178,14 @@ def build_production_clients(
         }
     )
     return BeastMarketRuntimeClients(
-        kafka_producer=Producer({"bootstrap.servers": kafka_bootstrap_servers}),
+        kafka_producer=Producer(
+            {
+                "bootstrap.servers": kafka_bootstrap_servers,
+                "message.timeout.ms": max(1000, int(resolved_kafka.delivery_timeout_seconds * 1000)),
+            }
+        ),
         kafka_consumer=ConfluentKafkaConsumerAdapter(consumer, TopicPartition),
-        redis_client=redis.Redis.from_url(redis_url),
+        redis_client=redis_client,
         duckdb_connection=duckdb_connection,
         market_data_client=XtQuantMarketDataClient(
             callback_sink=callback_sink,
@@ -145,6 +196,95 @@ def build_production_clients(
         if enable_xtquant
         else None,
     )
+
+
+def configure_redis_limits(redis_client, *, maxmemory: str = "", maxmemory_policy: str = "volatile-ttl") -> None:
+    if maxmemory:
+        redis_client.config_set("maxmemory", maxmemory)
+    if maxmemory_policy:
+        redis_client.config_set("maxmemory-policy", maxmemory_policy)
+
+
+def kafka_metadata_available(admin_client_factory, bootstrap_servers: str, *, timeout_seconds: float = 2.0) -> tuple[bool, str]:
+    try:
+        admin_client = admin_client_factory(
+            {
+                "bootstrap.servers": bootstrap_servers,
+                "socket.timeout.ms": int(timeout_seconds * 1000),
+                "request.timeout.ms": int(timeout_seconds * 1000),
+            }
+        )
+        metadata = admin_client.list_topics(timeout=timeout_seconds)
+        brokers = getattr(metadata, "brokers", None)
+        return bool(brokers), "" if brokers else "broker metadata empty"
+    except Exception as error:
+        return False, str(error)
+
+
+class DegradedKafkaProducer:
+    """Local append-only producer used when Kafka is unavailable by policy."""
+
+    degraded = True
+
+    def __init__(self, path: str | Path, *, reason: str) -> None:
+        self.path = Path(path)
+        self.reason = reason
+        self.produced = 0
+
+    def produce(self, topic: str, *, key: bytes, value: bytes, on_delivery=None, callback=None) -> None:
+        self.produced += 1
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        record = {
+            "schema_version": 1,
+            "spooled_at": now_iso(),
+            "topic": topic,
+            "key": decode_bytes(key),
+            "value": decode_json_bytes(value),
+            "reason": self.reason,
+        }
+        with self.path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, separators=(",", ":"), ensure_ascii=False) + "\n")
+        delivery_callback = on_delivery or callback
+        if callable(delivery_callback):
+            delivery_callback(None, None)
+
+    def flush(self, timeout: float | None = None) -> int:
+        return 0
+
+    def poll(self, timeout: float | None = None) -> int:
+        return 0
+
+
+class UnavailableKafkaConsumer:
+    degraded = True
+
+    def __init__(self, *, reason: str) -> None:
+        self.reason = reason
+        self._committed_offsets: dict[str, int] = {}
+
+    def poll(self, topic: str, offset: int, timeout_ms: int = 0) -> list[dict]:
+        return []
+
+    def commit(self, topic: str, offset: int) -> None:
+        self._committed_offsets[topic] = offset
+
+    def committed(self, topic: str) -> int:
+        return self._committed_offsets.get(topic, 0)
+
+    def high_watermark(self, topic: str) -> int:
+        return self._committed_offsets.get(topic, 0)
+
+
+def decode_bytes(value: bytes) -> str:
+    return value.decode("utf-8", errors="replace") if isinstance(value, bytes) else str(value)
+
+
+def decode_json_bytes(value: bytes) -> object:
+    decoded = decode_bytes(value)
+    try:
+        return json.loads(decoded)
+    except json.JSONDecodeError:
+        return decoded
 
 
 def build_runtime_with_deferred_xtquant(config: BeastMarketRuntimeConfig, clients: BeastMarketRuntimeClients):

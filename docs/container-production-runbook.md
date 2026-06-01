@@ -35,7 +35,18 @@ STARTUP_INTRADAY_RECOVERY=false
 PERSIST_REALTIME_EVENTS=false
 COMMIT_RUNTIME_OWNED_RAW_OFFSETS=false
 HEALTH_SNAPSHOT_EVERY_TICKS=20
+RUNTIME_HEALTH_MAX_AGE_SECONDS=30
 TICK_INTERVAL_SECONDS=0.1
+KAFKA_BOOTSTRAP_SERVERS=127.0.0.1:19092
+KAFKA_RETENTION_MS=86400000
+KAFKA_RAW_RETENTION_BYTES=5368709120
+KAFKA_PROCESSED_RETENTION_BYTES=5368709120
+ALLOW_KAFKA_DEGRADED=true
+REDIS_MAXMEMORY=1gb
+REDIS_MAXMEMORY_POLICY=volatile-ttl
+REDIS_HISTORY_TTL_SECONDS=604800
+MIN_ARTIFACT_FREE_BYTES=21474836480
+WARN_ARTIFACT_FREE_BYTES=107374182400
 ```
 
 For same-day manual recovery or afternoon debugging, set `WAIT_FOR_MARKET_START=false` and keep `RUNTIME_TRADE_DATE` on the current HK trade date. Do not advance `RUNTIME_TRADE_DATE` to tomorrow while expecting today's realtime data.
@@ -45,22 +56,12 @@ Start Redis/Redpanda and the backend. The current deployment uses host networkin
 ```bash
 docker build -t thousand-backend:production -f backend/Dockerfile.production .
 
-docker run -d \
-  --name thousand-backend-${RUNTIME_TRADE_DATE} \
-  --restart unless-stopped \
-  --network host \
-  --env-file infra/production.env \
-  -e PYTHONUNBUFFERED=1 \
-  -e PYTHONPATH=/app/backend \
-  -e TZ=Asia/Shanghai \
-  -v /home/hliu/thousand/artifacts:/app/artifacts \
-  -v ${SILVER_ROOT}:/data/silver:ro \
-  -v ${XTQUANT_SDK_PATH}:/xtquant/sdk:ro \
-  -v ${XTQUANT_DATA_HOME}:/xtquant/data \
-  thousand-backend:production
+infra/run-live-backend.sh
 ```
 
 The backend entrypoint waits until `RUNTIME_START_AT` on `RUNTIME_TRADE_DATE` in `Asia/Shanghai` when `WAIT_FOR_MARKET_START=true`, writes and verifies `artifacts/runtime-config.json`, then starts `beast_market.production_runtime`. With `RUNTIME_START_AT=09:25`, the runtime should be connected and subscribed before 09:30.
+
+For compose-managed Redpanda, `infra/configure-redpanda-retention.sh` creates or updates the raw and processed topics with 24h retention and 5GiB per-topic byte caps. For the manual live backend path, the default Kafka endpoint is `127.0.0.1:19092`, matching the compose external listener.
 
 ## Cloudflare Tunnel
 
@@ -149,15 +150,36 @@ PY
 ## Persistence
 
 - Redis uses a Docker volume with AOF enabled when started through compose.
-- Redpanda uses a Docker volume when started through compose.
-- Backend runtime state, Kafka spool, generated config, tunnel logs, and health snapshots are under the host `artifacts/` directory.
+- Redis is capped by default at `1gb` with `volatile-ttl`; CCASS history TTL defaults to 7 days.
+- Redpanda uses a Docker volume when started through compose, with topic retention capped by `KAFKA_RETENTION_MS` and per-topic bytes.
+- Backend runtime state, Kafka spool, degraded Kafka audit logs, generated config, tunnel logs, and health snapshots are under the host `artifacts/` directory.
 - xtquant runtime data is mounted from `XTQUANT_DATA_HOME`.
+
+Run cleanup in dry-run mode first:
+
+```bash
+infra/cleanup-production-artifacts.sh
+```
+
+Apply cleanup after review:
+
+```bash
+CONFIRM=true PRUNE_DOCKER_BUILD_CACHE=true infra/cleanup-production-artifacts.sh
+```
+
+This gzips old runtime JSONL, deletes runtime-state date directories older than 7 days, and prunes oversized validation data.
 
 ## Stop Or Restart
 
 ```bash
 docker restart thousand-backend-${RUNTIME_TRADE_DATE}
 docker rm -f thousand-backend-${RUNTIME_TRADE_DATE}
+```
+
+To auto-restart a wedged live backend from host health evidence:
+
+```bash
+START_BACKEND_WATCHDOG=true infra/run-live-backend.sh
 ```
 
 Use `docker compose ... down -v` only when you intentionally want to delete Redis/Redpanda data from the compose-managed stack.

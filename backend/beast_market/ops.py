@@ -38,7 +38,7 @@ from .cutover import (
     workflow_evidence_blockers,
 )
 from .mammoth_api import MammothAPI, REQUIRED_HISTORICAL_MANIFEST_TYPES, save_manifest
-from .runtime_state import RuntimeStateClearResult, clear_runtime_state_files
+from .runtime_state import RuntimeStateClearResult, RuntimeStatePruneResult, clear_runtime_state_files, prune_runtime_state
 from .shadow_run import FileBackedShadowRunRecorder, LegacyShadowTelemetryAdapter, build_shadow_run_report_from_files, shadow_run_file_paths
 
 
@@ -523,6 +523,25 @@ def clear_runtime_state(
         confirm=confirm,
         include_callback_rejections=include_callback_rejections,
         include_dead_letters=include_dead_letters,
+    )
+
+
+def prune_runtime_state_artifacts(
+    *,
+    runtime_state_root: str | Path,
+    reference_date: str,
+    archive_after_days: int = 1,
+    delete_after_days: int = 7,
+    dry_run: bool = True,
+    confirm: bool = False,
+) -> RuntimeStatePruneResult:
+    return prune_runtime_state(
+        runtime_state_root,
+        reference_date=reference_date,
+        archive_after_days=archive_after_days,
+        delete_after_days=delete_after_days,
+        dry_run=dry_run,
+        confirm=confirm,
     )
 
 

@@ -39,7 +39,7 @@ class KafkaAdapterConfig:
 @dataclass(frozen=True)
 class RedisAdapterConfig:
     terminal_ttl_seconds: int = 60 * 60 * 8
-    history_ttl_seconds: int = 60 * 60 * 24 * 30
+    history_ttl_seconds: int = 60 * 60 * 24 * 7
 
 
 @dataclass

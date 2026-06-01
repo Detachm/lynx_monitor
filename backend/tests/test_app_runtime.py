@@ -41,6 +41,8 @@ from beast_market.app_runtime import (
 )
 from beast_market.production_runtime import (
     ConfluentKafkaConsumerAdapter,
+    DegradedKafkaProducer,
+    UnavailableKafkaConsumer,
     build_parser,
     build_runtime_with_deferred_xtquant,
     with_gateway_port,
@@ -167,6 +169,32 @@ class AppRuntimeTest(unittest.TestCase):
         self.assertEqual(args.health_snapshot_interval_seconds, 5)
         self.assertEqual(updated.gateway_port, 19020)
         self.assertEqual(config.gateway_port, 9020)
+
+    def test_degraded_kafka_producer_spools_locally_without_blocking_delivery(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "kafka-degraded-audit.jsonl"
+            producer = DegradedKafkaProducer(path, reason="broker unavailable")
+            callbacks: list[object] = []
+
+            producer.produce(
+                "raw_market_events_v1",
+                key=b"00700.HK",
+                value=b'{"symbol":"00700.HK"}',
+                on_delivery=lambda error, message: callbacks.append(error),
+            )
+
+            self.assertEqual(callbacks, [None])
+            self.assertEqual(producer.produced, 1)
+            self.assertIn("broker unavailable", path.read_text(encoding="utf-8"))
+
+    def test_unavailable_kafka_consumer_reports_zero_lag_and_accepts_commits(self) -> None:
+        consumer = UnavailableKafkaConsumer(reason="broker unavailable")
+
+        self.assertEqual(consumer.poll("raw_market_events_v1", 0), [])
+        consumer.commit("raw_market_events_v1", 3)
+
+        self.assertEqual(consumer.committed("raw_market_events_v1"), 3)
+        self.assertEqual(consumer.high_watermark("raw_market_events_v1"), 3)
 
     def test_confluent_consumer_adapter_keeps_raw_and_processed_subscriptions(self) -> None:
         consumer = FakeConfluentConsumer()

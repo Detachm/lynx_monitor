@@ -20,6 +20,7 @@ def evaluate_runtime_health_snapshot(
     now: datetime | None = None,
     max_age_seconds: float = 60.0,
     max_topic_lag: int = 0,
+    require_kafka: bool = False,
 ) -> RuntimeHealthcheckResult:
     blockers: list[str] = []
     if snapshot.get("schema_version") != 1:
@@ -60,6 +61,13 @@ def evaluate_runtime_health_snapshot(
         elif lag > max_topic_lag:
             blockers.append(f"topic_{topic}_lag_exceeded")
 
+    kafka = record_value(snapshot.get("kafka")) or {}
+    if require_kafka:
+        if kafka.get("producer_degraded") is True:
+            blockers.append("kafka_producer_degraded")
+        if kafka.get("consumer_degraded") is True:
+            blockers.append("kafka_consumer_degraded")
+
     producer = record_value(snapshot.get("producer")) or {}
     if non_negative_int(producer.get("dead_letters"), default=0) > 0:
         blockers.append("producer_dead_letters_present")
@@ -90,6 +98,7 @@ def evaluate_runtime_health_file(
     now: datetime | None = None,
     max_age_seconds: float = 60.0,
     max_topic_lag: int = 0,
+    require_kafka: bool = False,
 ) -> RuntimeHealthcheckResult:
     snapshot_path = Path(path)
     if not snapshot_path.exists():
@@ -105,6 +114,7 @@ def evaluate_runtime_health_file(
         now=now,
         max_age_seconds=max_age_seconds,
         max_topic_lag=max_topic_lag,
+        require_kafka=require_kafka,
     )
 
 
@@ -144,11 +154,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--path", default="artifacts/runtime-health.json")
     parser.add_argument("--max-age-seconds", type=float, default=60.0)
     parser.add_argument("--max-topic-lag", type=int, default=0)
+    parser.add_argument("--require-kafka", action="store_true")
     args = parser.parse_args(argv)
     result = evaluate_runtime_health_file(
         args.path,
         max_age_seconds=args.max_age_seconds,
         max_topic_lag=args.max_topic_lag,
+        require_kafka=args.require_kafka,
     )
     if result.healthy:
         print("ok")

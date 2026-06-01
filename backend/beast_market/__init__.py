@@ -129,7 +129,14 @@ from .ops import (
     validate_redis_read_model_coverage,
     verify_multi_trader_smoke_services,
 )
-from .runtime_state import RuntimeStateClearResult, RuntimeStatePaths, RuntimeStateStore, clear_runtime_state_files
+from .runtime_state import (
+    RuntimeStateClearResult,
+    RuntimeStatePaths,
+    RuntimeStatePruneResult,
+    RuntimeStateStore,
+    clear_runtime_state_files,
+    prune_runtime_state,
+)
 from .symbol_runtime import HistoricalHydrationService, HydrationKey, SymbolRuntime, SymbolRuntimeManager, SymbolRuntimeState
 from .gateway import GatewayClientQueue
 from .gateway_transport import GatewayV2SessionManager
@@ -222,6 +229,7 @@ __all__ = [
     "RuntimeLifecycleState",
     "RuntimeStateClearResult",
     "RuntimeStatePaths",
+    "RuntimeStatePruneResult",
     "RuntimeStateStore",
     "RuntimeSignalStopController",
     "SymbolRuntime",
@@ -267,6 +275,7 @@ __all__ = [
     "clear_runtime_cache",
     "clear_runtime_state",
     "clear_runtime_state_files",
+    "prune_runtime_state",
     "explain_active_pool_symbol",
     "build_multi_trader_smoke_workflows_template",
     "MultiTraderSmokeFinalizeResult",

@@ -42,6 +42,10 @@ docker run -d \
   --name "${container_name}" \
   --restart unless-stopped \
   --network host \
+  --health-cmd "PYTHONPATH=/app/backend python -m beast_market.healthcheck --path /app/artifacts/runtime-health-live-${runtime_trade_date}.json --max-age-seconds \${RUNTIME_HEALTH_MAX_AGE_SECONDS:-30}" \
+  --health-interval 15s \
+  --health-timeout 3s \
+  --health-retries 3 \
   -e TZ=Asia/Shanghai \
   -e PYTHONPATH=/app/backend \
   -e PYTHONUNBUFFERED=1 \
@@ -56,8 +60,15 @@ docker run -d \
   -e RUNTIME_START_AT="${RUNTIME_START_AT:-09:25}" \
   -e WAIT_FOR_MARKET_START="${WAIT_FOR_MARKET_START:-false}" \
   -e SILVER_ROOT=/data/silver \
-  -e KAFKA_BOOTSTRAP_SERVERS="${KAFKA_BOOTSTRAP_SERVERS:-127.0.0.1:9092}" \
+  -e KAFKA_BOOTSTRAP_SERVERS="${KAFKA_BOOTSTRAP_SERVERS:-127.0.0.1:19092}" \
   -e REDIS_URL="${REDIS_URL:-redis://127.0.0.1:6379/0}" \
+  -e ALLOW_KAFKA_DEGRADED="${ALLOW_KAFKA_DEGRADED:-true}" \
+  -e REDIS_MAXMEMORY="${REDIS_MAXMEMORY:-1gb}" \
+  -e REDIS_MAXMEMORY_POLICY="${REDIS_MAXMEMORY_POLICY:-volatile-ttl}" \
+  -e REDIS_HISTORY_TTL_SECONDS="${REDIS_HISTORY_TTL_SECONDS:-604800}" \
+  -e RUNTIME_HEALTH_MAX_AGE_SECONDS="${RUNTIME_HEALTH_MAX_AGE_SECONDS:-30}" \
+  -e MIN_ARTIFACT_FREE_BYTES="${MIN_ARTIFACT_FREE_BYTES:-21474836480}" \
+  -e WARN_ARTIFACT_FREE_BYTES="${WARN_ARTIFACT_FREE_BYTES:-107374182400}" \
   -e GATEWAY_HOST="${GATEWAY_HOST:-0.0.0.0}" \
   -e GATEWAY_PORT="${GATEWAY_PORT:-9020}" \
   -e ACTIVE_POOL_TARGET_SIZE="${ACTIVE_POOL_TARGET_SIZE:-200}" \
@@ -84,3 +95,11 @@ docker run -d \
   -v "${host_xtquant_sdk_path}:/xtquant/sdk:ro" \
   -v "${host_xtquant_data_home}:/xtquant/data" \
   thousand-backend:production
+
+if [[ "${START_BACKEND_WATCHDOG:-false}" == "true" || "${START_BACKEND_WATCHDOG:-false}" == "1" ]]; then
+  mkdir -p "${host_artifact_dir}/logs"
+  BACKEND_CONTAINER_NAME="${container_name}" \
+  HEALTH_SNAPSHOT_PATH="${host_artifact_dir}/runtime-health-live-${runtime_trade_date}.json" \
+  nohup "${ROOT_DIR}/infra/backend-watchdog.sh" \
+    >> "${host_artifact_dir}/logs/backend-watchdog-${runtime_trade_date}.log" 2>&1 &
+fi

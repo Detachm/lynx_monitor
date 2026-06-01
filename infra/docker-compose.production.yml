@@ -1,7 +1,18 @@
 services:
   redis:
     image: redis:7-alpine
-    command: ["redis-server", "--appendonly", "yes"]
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --maxmemory
+      - ${REDIS_MAXMEMORY:-1gb}
+      - --maxmemory-policy
+      - ${REDIS_MAXMEMORY_POLICY:-volatile-ttl}
+      - --auto-aof-rewrite-percentage
+      - "100"
+      - --auto-aof-rewrite-min-size
+      - 64mb
     restart: unless-stopped
     ports:
       - "127.0.0.1:6379:6379"
@@ -44,6 +55,23 @@ services:
       timeout: 5s
       retries: 18
 
+  redpanda-init:
+    image: docker.redpanda.com/redpandadata/redpanda:v24.3.7
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    restart: "no"
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
+      KAFKA_RETENTION_MS: ${KAFKA_RETENTION_MS:-86400000}
+      KAFKA_RAW_RETENTION_BYTES: ${KAFKA_RAW_RETENTION_BYTES:-5368709120}
+      KAFKA_PROCESSED_RETENTION_BYTES: ${KAFKA_PROCESSED_RETENTION_BYTES:-5368709120}
+      KAFKA_RAW_TOPIC: ${KAFKA_RAW_TOPIC:-raw_market_events_v1}
+      KAFKA_PROCESSED_TOPIC: ${KAFKA_PROCESSED_TOPIC:-processed_market_events_v1}
+    volumes:
+      - ./configure-redpanda-retention.sh:/usr/local/bin/configure-redpanda-retention.sh:ro
+    command: ["/usr/local/bin/configure-redpanda-retention.sh"]
+
   backend:
     build:
       context: ..
@@ -54,6 +82,8 @@ services:
         condition: service_healthy
       redpanda:
         condition: service_healthy
+      redpanda-init:
+        condition: service_completed_successfully
     environment:
       TZ: Asia/Shanghai
       RUNTIME_TRADE_DATE: ${RUNTIME_TRADE_DATE:-}
@@ -75,7 +105,13 @@ services:
       KAFKA_POLL_TIMEOUT_MS: ${KAFKA_POLL_TIMEOUT_MS:-1}
       HEALTH_SNAPSHOT_EVERY_TICKS: ${HEALTH_SNAPSHOT_EVERY_TICKS:-20}
       HEALTH_SNAPSHOT_INTERVAL_SECONDS: ${HEALTH_SNAPSHOT_INTERVAL_SECONDS:-5}
-      RUNTIME_HEALTH_MAX_AGE_SECONDS: ${RUNTIME_HEALTH_MAX_AGE_SECONDS:-60}
+      RUNTIME_HEALTH_MAX_AGE_SECONDS: ${RUNTIME_HEALTH_MAX_AGE_SECONDS:-30}
+      ALLOW_KAFKA_DEGRADED: ${ALLOW_KAFKA_DEGRADED:-true}
+      REDIS_MAXMEMORY: ${REDIS_MAXMEMORY:-1gb}
+      REDIS_MAXMEMORY_POLICY: ${REDIS_MAXMEMORY_POLICY:-volatile-ttl}
+      REDIS_HISTORY_TTL_SECONDS: ${REDIS_HISTORY_TTL_SECONDS:-604800}
+      MIN_ARTIFACT_FREE_BYTES: ${MIN_ARTIFACT_FREE_BYTES:-21474836480}
+      WARN_ARTIFACT_FREE_BYTES: ${WARN_ARTIFACT_FREE_BYTES:-107374182400}
       TICK_INTERVAL_SECONDS: ${TICK_INTERVAL_SECONDS:-0.1}
       XTQUANT_SDK_PATH: /xtquant/sdk
       XTQUANT_DATA_HOME: /xtquant/data
@@ -93,7 +129,7 @@ services:
       - ${XTQUANT_SDK_PATH:-/home/hliu/xtbackend/vendor/xtquant_251211_interim-release_cp36m-37m-38-39-310-311-312_linux-gnu_x86_64}:/xtquant/sdk:ro
       - ${XTQUANT_DATA_HOME:-../artifacts/xtquant-data}:/xtquant/data
     healthcheck:
-      test: ["CMD-SHELL", "PYTHONPATH=/app/backend python -m beast_market.healthcheck --path /app/artifacts/runtime-health.json --max-age-seconds $${RUNTIME_HEALTH_MAX_AGE_SECONDS:-60}"]
+      test: ["CMD-SHELL", "PYTHONPATH=/app/backend python -m beast_market.healthcheck --path /app/artifacts/runtime-health.json --max-age-seconds $${RUNTIME_HEALTH_MAX_AGE_SECONDS:-30}"]
       interval: 15s
       timeout: 3s
       retries: 20

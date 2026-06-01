@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import gzip
 import json
+import shutil
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +25,15 @@ class RuntimeStateClearResult:
     confirmed: bool
     paths: list[str]
     deleted_paths: list[str]
+
+
+@dataclass(frozen=True)
+class RuntimeStatePruneResult:
+    dry_run: bool
+    confirmed: bool
+    archived_paths: list[str]
+    deleted_paths: list[str]
+    kept_paths: list[str]
 
 
 class RuntimeStateStore:
@@ -178,3 +190,86 @@ def clear_runtime_state_files(
         paths=[str(path) for path in paths],
         deleted_paths=[str(path) for path in deleted],
     )
+
+
+def prune_runtime_state(
+    root: str | Path,
+    *,
+    reference_date: str,
+    archive_after_days: int = 1,
+    delete_after_days: int = 7,
+    dry_run: bool = True,
+    confirm: bool = False,
+) -> RuntimeStatePruneResult:
+    if archive_after_days < 0:
+        raise ValueError("archive_after_days must be >= 0")
+    if delete_after_days < archive_after_days:
+        raise ValueError("delete_after_days must be >= archive_after_days")
+    if not dry_run and not confirm:
+        raise ValueError("prune-runtime-state requires --confirm when not running as dry-run")
+
+    reference = parse_trade_date(reference_date)
+    state_root = Path(root)
+    archived: list[Path] = []
+    deleted: list[Path] = []
+    kept: list[Path] = []
+
+    if not state_root.exists():
+        return RuntimeStatePruneResult(
+            dry_run=dry_run,
+            confirmed=confirm,
+            archived_paths=[],
+            deleted_paths=[],
+            kept_paths=[],
+        )
+
+    for date_dir in sorted(path for path in state_root.iterdir() if path.is_dir()):
+        trade_date = date_dir.name
+        if not is_trade_date_directory(trade_date):
+            kept.append(date_dir)
+            continue
+        age_days = (reference - parse_trade_date(trade_date)).days
+        if age_days < archive_after_days:
+            kept.append(date_dir)
+            continue
+        if age_days > delete_after_days:
+            deleted.append(date_dir)
+            if not dry_run:
+                shutil.rmtree(date_dir)
+            continue
+        for jsonl_path in sorted(date_dir.rglob("*.jsonl")):
+            gzip_path = jsonl_path.with_suffix(jsonl_path.suffix + ".gz")
+            if gzip_path.exists():
+                kept.append(gzip_path)
+                if not dry_run and jsonl_path.exists():
+                    jsonl_path.unlink()
+                continue
+            archived.append(gzip_path)
+            if not dry_run:
+                gzip_jsonl_file(jsonl_path, gzip_path)
+                jsonl_path.unlink()
+        kept.append(date_dir)
+
+    return RuntimeStatePruneResult(
+        dry_run=dry_run,
+        confirmed=confirm,
+        archived_paths=[str(path) for path in archived],
+        deleted_paths=[str(path) for path in deleted],
+        kept_paths=[str(path) for path in kept],
+    )
+
+
+def gzip_jsonl_file(source: Path, target: Path) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with source.open("rb") as source_handle, gzip.open(target, "wb") as target_handle:
+        shutil.copyfileobj(source_handle, target_handle)
+
+
+def is_trade_date_directory(value: str) -> bool:
+    return value.isdigit() and len(value) == 8
+
+
+def parse_trade_date(value: str) -> datetime:
+    if not is_trade_date_directory(value):
+        raise ValueError("reference_date must use YYYYMMDD format")
+    return datetime.strptime(value, "%Y%m%d")

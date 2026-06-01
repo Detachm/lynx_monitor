@@ -33,6 +33,7 @@ from .ops import (
     inspect_multi_trader_smoke_readiness,
     package_multi_trader_smoke,
     pin_active_pool_symbol,
+    prune_runtime_state_artifacts,
     prepare_multi_trader_smoke,
     record_multi_trader_smoke_workflow,
     replay_kafka_spool,
@@ -304,6 +305,29 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "confirmed": result.confirmed,
                     "paths": result.paths,
                     "deleted_paths": result.deleted_paths,
+                },
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if args.command == "prune-runtime-state":
+        result = prune_runtime_state_artifacts(
+            runtime_state_root=args.runtime_state_root,
+            reference_date=args.reference_date,
+            archive_after_days=args.archive_after_days,
+            delete_after_days=args.delete_after_days,
+            dry_run=args.dry_run or not args.confirm,
+            confirm=args.confirm,
+        )
+        print(
+            json.dumps(
+                {
+                    "dry_run": result.dry_run,
+                    "confirmed": result.confirmed,
+                    "archived_paths": result.archived_paths,
+                    "deleted_paths": result.deleted_paths,
+                    "kept_paths": result.kept_paths,
                 },
                 sort_keys=True,
             )
@@ -917,6 +941,17 @@ def build_parser() -> argparse.ArgumentParser:
     runtime_state.add_argument("--include-dead-letters", action="store_true")
     runtime_state.add_argument("--dry-run", action="store_true")
     runtime_state.add_argument("--confirm", action="store_true")
+
+    prune_state = subparsers.add_parser(
+        "prune-runtime-state",
+        help="Gzip old runtime JSONL date directories and delete expired runtime-state days.",
+    )
+    prune_state.add_argument("--runtime-state-root", default="artifacts/runtime-state")
+    prune_state.add_argument("--reference-date", required=True)
+    prune_state.add_argument("--archive-after-days", type=int, default=1)
+    prune_state.add_argument("--delete-after-days", type=int, default=7)
+    prune_state.add_argument("--dry-run", action="store_true")
+    prune_state.add_argument("--confirm", action="store_true")
 
     replay_spool = subparsers.add_parser(
         "replay-kafka-spool",

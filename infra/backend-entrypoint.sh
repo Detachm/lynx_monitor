@@ -17,6 +17,32 @@ export RUNTIME_START_AT WAIT_FOR_MARKET_START
 
 mkdir -p "${ARTIFACT_DIR}" "${RUNTIME_STATE_ROOT}" "${KAFKA_SPOOL_DIR}"
 
+python - <<'PY'
+import os
+import shutil
+from pathlib import Path
+
+def int_env(name, default):
+    try:
+        return int(os.environ.get(name, default))
+    except ValueError:
+        return default
+
+artifact_dir = Path(os.environ["ARTIFACT_DIR"])
+min_free_bytes = int_env("MIN_ARTIFACT_FREE_BYTES", 20 * 1024 * 1024 * 1024)
+warn_free_bytes = int_env("WARN_ARTIFACT_FREE_BYTES", 100 * 1024 * 1024 * 1024)
+usage = shutil.disk_usage(artifact_dir)
+if usage.free < min_free_bytes:
+    raise SystemExit(
+        f"artifact disk free bytes {usage.free} is below MIN_ARTIFACT_FREE_BYTES={min_free_bytes}"
+    )
+if usage.free < warn_free_bytes:
+    print(
+        f"warning: artifact disk free bytes {usage.free} is below WARN_ARTIFACT_FREE_BYTES={warn_free_bytes}",
+        flush=True,
+    )
+PY
+
 if [[ "${WAIT_FOR_MARKET_START}" == "true" || "${WAIT_FOR_MARKET_START}" == "1" ]]; then
   python - <<'PY'
 import os
@@ -80,7 +106,7 @@ config = {
     },
     "redis": {
         "terminal_ttl_seconds": int_env("REDIS_TERMINAL_TTL_SECONDS", 28800),
-        "history_ttl_seconds": int_env("REDIS_HISTORY_TTL_SECONDS", 2592000),
+        "history_ttl_seconds": int_env("REDIS_HISTORY_TTL_SECONDS", 604800),
     },
     "runtime": {
         "runtime_state_root": os.environ["RUNTIME_STATE_ROOT"],
@@ -136,6 +162,9 @@ args=(
   --config-path "${CONFIG_PATH}"
   --kafka-bootstrap-servers "${KAFKA_BOOTSTRAP_SERVERS:-redpanda:9092}"
   --redis-url "${REDIS_URL:-redis://redis:6379/0}"
+  --kafka-degraded-spool-dir "${KAFKA_SPOOL_DIR}"
+  --redis-maxmemory "${REDIS_MAXMEMORY:-1gb}"
+  --redis-maxmemory-policy "${REDIS_MAXMEMORY_POLICY:-volatile-ttl}"
   --gateway-host "${GATEWAY_HOST:-0.0.0.0}"
   --gateway-port "${GATEWAY_PORT:-9020}"
   --health-snapshot-path "${HEALTH_SNAPSHOT_PATH}"
@@ -148,6 +177,9 @@ args=(
 
 if [[ -n "${HEALTH_SNAPSHOT_INTERVAL_SECONDS:-}" ]]; then
   args+=(--health-snapshot-interval-seconds "${HEALTH_SNAPSHOT_INTERVAL_SECONDS}")
+fi
+if [[ "${ALLOW_KAFKA_DEGRADED:-true}" == "true" || "${ALLOW_KAFKA_DEGRADED:-true}" == "1" ]]; then
+  args+=(--allow-kafka-degraded)
 fi
 if [[ -n "${RUNTIME_SYMBOLS:-}" ]]; then
   args+=(--symbols "${RUNTIME_SYMBOLS}")

@@ -615,6 +615,10 @@ def build_beast_market_runtime(
         ),
     )
     gateway = GatewayV2(event_bus, cache)
+    if kafka_client_degraded(clients.kafka_producer) or kafka_client_degraded(clients.kafka_consumer):
+        collector.health.kafka = "degraded"
+        octopus.health.kafka = "degraded"
+        gateway.health.kafka = "degraded"
     active_pool_manager = ActiveSymbolPoolManager(
         mammoth,
         trade_date=config.trade_date,
@@ -1372,7 +1376,7 @@ def runtime_config_from_artifact(config: dict[str, Any]) -> BeastMarketRuntimeCo
         ),
         redis=RedisAdapterConfig(
             terminal_ttl_seconds=int_value(redis.get("terminal_ttl_seconds"), default=60 * 60 * 8),
-            history_ttl_seconds=int_value(redis.get("history_ttl_seconds"), default=60 * 60 * 24 * 30),
+            history_ttl_seconds=int_value(redis.get("history_ttl_seconds"), default=60 * 60 * 24 * 7),
         ),
     )
 
@@ -1694,6 +1698,7 @@ def build_runtime_health_snapshot(
                 "lag": runtime.kafka_adapter.lag(processed_topic, processed_committed),
             },
         },
+        "kafka": kafka_status_snapshot(runtime),
         "queues": {
             "raw_callback_backlog": runtime.raw_queue.backlog,
             "raw_callback_rejected": len(runtime.raw_queue.dropped),
@@ -1748,6 +1753,23 @@ def build_runtime_health_snapshot(
             "gateway": runtime.gateway.health.as_message()["payload"],
         },
     }
+
+
+def kafka_status_snapshot(runtime: BeastMarketRuntime) -> dict[str, Any]:
+    producer = runtime.kafka_adapter.producer
+    consumer = runtime.kafka_adapter.consumer
+    return {
+        "producer_degraded": kafka_client_degraded(producer),
+        "consumer_degraded": kafka_client_degraded(consumer),
+        "producer_reason": str(getattr(producer, "reason", "") or ""),
+        "consumer_reason": str(getattr(consumer, "reason", "") or ""),
+        "degraded_audit_path": str(getattr(producer, "path", "") or ""),
+        "degraded_audit_records": int(getattr(producer, "produced", 0) or 0),
+    }
+
+
+def kafka_client_degraded(client: Any) -> bool:
+    return getattr(client, "degraded", False) is True
 
 
 def write_runtime_health_snapshot(
