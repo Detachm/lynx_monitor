@@ -537,20 +537,60 @@ class BoundedRawEventQueue:
             raise ValueError("max_size must be >= 1")
         self.max_size = max_size
         self.items: deque[dict[str, Any]] = deque()
+        self.coalesced_items: dict[str, dict[str, Any]] = {}
         self.dropped: list[dict[str, Any]] = []
 
     def push(self, event: dict[str, Any]) -> bool:
+        coalesce_key = raw_event_queue_coalesce_key(event)
+        if coalesce_key and coalesce_key in self.coalesced_items:
+            self.coalesced_items[coalesce_key] = event
+            return True
         if len(self.items) >= self.max_size:
             self.dropped.append(event)
             return False
-        self.items.append(event)
+        if coalesce_key:
+            self.coalesced_items[coalesce_key] = event
+            self.items.append({"__coalesce_key__": coalesce_key})
+        else:
+            self.items.append(event)
         return True
 
     def pop(self) -> dict[str, Any] | None:
-        if not self.items:
-            return None
-        return self.items.popleft()
+        while self.items:
+            event = self.items.popleft()
+            coalesce_key = event.get("__coalesce_key__")
+            if isinstance(coalesce_key, str):
+                coalesced = self.coalesced_items.pop(coalesce_key, None)
+                if coalesced is None:
+                    continue
+                return coalesced
+            return event
+        return None
 
     @property
     def backlog(self) -> int:
         return len(self.items)
+
+
+def raw_event_queue_coalesce_key(event: dict[str, Any]) -> str | None:
+    symbol = str(event.get("symbol") or event.get("code") or "").strip().upper()
+    period = str(event.get("period") or event.get("Period") or "").strip().lower()
+    kind = str(event.get("kind") or "").strip().lower()
+    if not symbol:
+        return None
+    if "." not in symbol and symbol.isdigit():
+        symbol = f"{symbol.zfill(5)}.HK"
+    coalesced_periods = {
+        "hkbrokerqueueex",
+        "broker_queue",
+        "brokerqueue",
+        "brokerqueue2",
+        "l2thousand",
+        "l2thousand_queue",
+        "l2_order_book",
+    }
+    if period in coalesced_periods:
+        return f"{symbol}|{period}"
+    if kind in {"broker_queue", "l2_order_book"}:
+        return f"{symbol}|{kind}"
+    return None

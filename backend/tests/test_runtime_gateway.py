@@ -181,6 +181,45 @@ class RuntimeGatewayTest(unittest.TestCase):
         self.assertEqual(events[0]["payload"]["entries"][0]["side"], "ask")
         self.assertGreaterEqual(worker.stats.callback_enqueue_last_latency_ms, 0.0)
 
+    def test_realtime_ingest_worker_coalesces_stale_broker_queue_callbacks(self) -> None:
+        worker = RealtimeIngestWorker(
+            BoundedRawEventQueue(max_size=1),
+            RealtimeCollectorV2(InMemoryEventBus()),
+            normalizer=normalize_xtquant_callback,
+        )
+
+        self.assertTrue(
+            worker.receive_callback(
+                {
+                    "symbol": "00700.HK",
+                    "period": "hkbrokerqueueex",
+                    "data": {
+                        "Time": 1779413401000,
+                        "BidQueues": [{"Price": 388.2, "Brokers": ["UBS"], "Volumes": [2000]}],
+                    },
+                }
+            )
+        )
+        self.assertTrue(
+            worker.receive_callback(
+                {
+                    "symbol": "00700.HK",
+                    "period": "hkbrokerqueueex",
+                    "data": {
+                        "Time": 1779413402000,
+                        "BidQueues": [{"Price": 389.0, "Brokers": ["JPM"], "Volumes": [3000]}],
+                    },
+                }
+            )
+        )
+
+        events = worker.drain_all()
+
+        self.assertEqual(worker.stats.rejected, 0)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["payload"]["entries"][0]["price"], 389.0)
+        self.assertEqual(events[0]["payload"]["entries"][0]["broker_code"], "JPM")
+
     def test_xtquant_market_data_client_wraps_callbacks_without_processing(self) -> None:
         xtdata = FakeXtData()
         received: list[dict] = []
