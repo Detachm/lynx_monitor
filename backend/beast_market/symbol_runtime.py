@@ -9,6 +9,7 @@ import time
 from typing import Any, Callable, Protocol
 
 from .contracts import make_terminal_message, now_iso, validate_processed_market_event
+from .trading_session import is_regular_hk_trading_minute
 
 HK_TZ = timezone(timedelta(hours=8))
 
@@ -290,9 +291,11 @@ class SymbolRuntimeManager:
                 if isinstance(snapshot, dict):
                     runtime.snapshot_payload["snapshot"] = snapshot
                 if isinstance(tick, dict):
+                    trade_date = terminal_payload_trade_date(payload, runtime.snapshot_payload, self.trade_date)
                     runtime.snapshot_payload["minute_bars"] = upsert_minute_bar(
                         runtime.snapshot_payload.get("minute_bars"),
                         tick,
+                        trade_date=trade_date,
                     )
                 self._update_freshness(runtime, payload)
                 applied = True
@@ -822,12 +825,14 @@ class SymbolRuntimeManager:
             return
 
 
-def upsert_minute_bar(existing: Any, tick: dict[str, Any]) -> list[dict[str, Any]]:
+def upsert_minute_bar(existing: Any, tick: dict[str, Any], *, trade_date: str | None = None) -> list[dict[str, Any]]:
     bars = [dict(item) for item in existing if isinstance(item, dict)] if isinstance(existing, list) else []
     timestamp = str(tick.get("timestamp") or "")
     if not timestamp:
         return bars[-MAX_MINUTE_BARS:]
     minute_ts = minute_bucket(timestamp)
+    if not is_regular_hk_trading_minute(minute_ts, trade_date):
+        return bars[-MAX_MINUTE_BARS:]
     tick_price = float(tick.get("price") or tick.get("close") or 0)
     tick_volume = int(tick.get("volume") or 0)
     tick_turnover = float(tick.get("turnover") or 0)
@@ -874,6 +879,42 @@ def prepend_unique_alert(alert: dict[str, Any], existing_alerts: list[dict[str, 
     else:
         deduped = [existing for existing in existing_alerts if existing != alert]
     return [alert, *deduped][:MAX_ALERTS]
+
+
+def terminal_payload_trade_date(
+    payload: dict[str, Any],
+    snapshot_payload: dict[str, Any] | None,
+    fallback: str,
+) -> str:
+    for candidate in (
+        extract_freshness_trade_date(payload.get("freshness")),
+        extract_snapshot_trade_date(payload.get("snapshot")),
+        extract_freshness_trade_date((snapshot_payload or {}).get("freshness")),
+        extract_snapshot_trade_date((snapshot_payload or {}).get("snapshot")),
+    ):
+        if candidate:
+            return candidate
+    return fallback
+
+
+def extract_freshness_trade_date(value: Any) -> str:
+    if not isinstance(value, dict):
+        return ""
+    for key in ("effective_trade_date", "effectiveTradeDate", "requested_trade_date", "requestedTradeDate"):
+        candidate = value.get(key)
+        if isinstance(candidate, str) and len(candidate) == 8 and candidate.isdigit():
+            return candidate
+    return ""
+
+
+def extract_snapshot_trade_date(value: Any) -> str:
+    if not isinstance(value, dict):
+        return ""
+    for key in ("tradeDate", "trade_date", "requestedTradeDate", "requested_trade_date"):
+        candidate = value.get(key)
+        if isinstance(candidate, str) and len(candidate) == 8 and candidate.isdigit():
+            return candidate
+    return ""
 
 
 def minute_bucket(timestamp: str) -> str:

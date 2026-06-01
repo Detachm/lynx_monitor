@@ -33,6 +33,7 @@ from .production_adapters import (
     RedisAdapterConfig,
     RedisSnapshotCacheAdapter,
 )
+from .trading_session import is_regular_hk_trading_minute
 from .runtime import (
     MarketDataSubscriptionClient,
     RawEventConsumerWorker,
@@ -1175,6 +1176,7 @@ def normalize_snapshot_minute_bars(snapshot: dict[str, Any]) -> None:
     raw_bars = snapshot.get("minute_bars")
     if not isinstance(raw_bars, list):
         return
+    trade_date = snapshot_trade_date(snapshot)
     merged_by_minute: dict[str, dict[str, Any]] = {}
     for raw_bar in raw_bars:
         if not isinstance(raw_bar, dict):
@@ -1183,6 +1185,8 @@ def normalize_snapshot_minute_bars(snapshot: dict[str, Any]) -> None:
         if not timestamp:
             continue
         bucket = minute_bucket(timestamp)
+        if not is_regular_hk_trading_minute(bucket, trade_date):
+            continue
         bar = dict(raw_bar)
         bar["timestamp"] = bucket
         previous = merged_by_minute.get(bucket)
@@ -1201,12 +1205,17 @@ def normalize_snapshot_minute_bars(snapshot: dict[str, Any]) -> None:
 
 def snapshot_trade_date(snapshot: dict[str, Any]) -> str:
     inner_snapshot = snapshot.get("snapshot")
-    if not isinstance(inner_snapshot, dict):
-        return ""
-    for key in ("tradeDate", "trade_date", "displayTradeDate", "display_trade_date"):
-        value = inner_snapshot.get(key)
-        if isinstance(value, str) and TRADE_DATE_PATTERN.fullmatch(value):
-            return value
+    if isinstance(inner_snapshot, dict):
+        for key in ("tradeDate", "trade_date", "displayTradeDate", "display_trade_date"):
+            value = inner_snapshot.get(key)
+            if isinstance(value, str) and TRADE_DATE_PATTERN.fullmatch(value):
+                return value
+    freshness = snapshot.get("freshness")
+    if isinstance(freshness, dict):
+        for key in ("effective_trade_date", "effectiveTradeDate", "requested_trade_date", "requestedTradeDate"):
+            value = freshness.get(key)
+            if isinstance(value, str) and TRADE_DATE_PATTERN.fullmatch(value):
+                return value
     return ""
 
 

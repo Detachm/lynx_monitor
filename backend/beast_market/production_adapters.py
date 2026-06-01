@@ -19,6 +19,7 @@ from .adapters import (
     validate_snapshot_symbol,
 )
 from .contracts import now_iso
+from .trading_session import is_regular_hk_trading_minute
 
 
 HK_TZ = timezone(timedelta(hours=8))
@@ -306,12 +307,12 @@ def merge_existing_minute_bars(trade_date: str, snapshot: dict[str, Any], existi
     for bar in existing_bars:
         if isinstance(bar, dict):
             bucket = minute_bar_bucket(bar)
-            if bucket:
+            if bucket and is_regular_hk_trading_minute(bucket, trade_date):
                 merged[bucket] = {**bar, "timestamp": bucket}
     for bar in new_bars:
         if isinstance(bar, dict):
             bucket = minute_bar_bucket(bar)
-            if bucket:
+            if bucket and is_regular_hk_trading_minute(bucket, trade_date):
                 merged[bucket] = {**bar, "timestamp": bucket}
     if not merged:
         return snapshot

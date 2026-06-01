@@ -262,6 +262,54 @@ describe('market store', () => {
     })
   })
 
+  it('filters cross-day and preopen minute bars from snapshots and realtime ticks', async () => {
+    const store = useMarketStore()
+    await store.subscribeSymbol('00700')
+
+    store.handleMessage({
+      type: 'snapshot',
+      symbol: '00700.HK',
+      snapshot: makeSnapshot('00700.HK', 388),
+      ticks: [
+        makeTick(387.8, '2026-05-21T16:08:00+08:00'),
+        makeTick(388.1, '2026-05-22T09:20:00+08:00'),
+        makeTick(388.5, '2026-05-22T09:30:25+08:00'),
+      ],
+      alerts: [],
+      askQueues: [],
+      bidQueues: [],
+      holding: [],
+      freshness: {
+        updatedAt: '2026-05-22T09:30:00+08:00',
+        runtimeState: 'WARM',
+        degraded: false,
+        degradedReasons: [],
+        requestedTradeDate: '20260522',
+        effectiveTradeDate: '20260522',
+        sourceDates: { minute_bars: '20260522' },
+      },
+    })
+
+    store.handleMessage({
+      type: 'tick_realtime',
+      symbol: '00700.HK',
+      tick: makeTick(388.2, '2026-05-22T09:29:59+08:00'),
+      freshness: {
+        updatedAt: '2026-05-22T09:29:59+08:00',
+        runtimeState: 'LIVE',
+        degraded: false,
+        degradedReasons: [],
+        requestedTradeDate: '20260522',
+        effectiveTradeDate: '20260522',
+        sourceDates: { minute_bars: '20260522' },
+      },
+    })
+
+    expect(store.symbols['00700.HK']!.ticks.map((tick) => tick.timestamp)).toEqual([
+      '2026-05-22T09:30:00+08:00',
+    ])
+  })
+
   it('records frontend store update performance samples for shadow-run evidence', () => {
     const store = useMarketStore()
     const samples: MarketPerformanceSample[] = []
@@ -730,7 +778,7 @@ function makeSnapshot(symbol: string, price: number): MarketSnapshot {
   }
 }
 
-function makeTick(price: number, timestamp = '2026-05-22T00:00:00.000Z'): PriceTick {
+function makeTick(price: number, timestamp = '2026-05-22T09:30:00+08:00'): PriceTick {
   return {
     timestamp,
     price,

@@ -19,6 +19,7 @@ from .contracts import (
 )
 from .freshness import FreshnessPolicy, SymbolFreshnessTracker
 from .mammoth_api import MammothAPI
+from .trading_session import is_regular_hk_trading_minute
 
 HK_TZ = timezone(timedelta(hours=8))
 
@@ -571,10 +572,12 @@ class OctopusComputeV2:
         }
         previous_close = float(state["snapshot"]["previousClose"])
         state["snapshot"]["changePercent"] = 0.0 if previous_close == 0 else state["snapshot"]["change"] / previous_close * 100
-        minute_tick = {**tick, "volume": 0, "turnover": 0.0} if is_full_tick_seed else tick
-        state["minute_bars"] = upsert_minute_bar(state["minute_bars"], minute_tick)
+        updates_chart = is_regular_hk_trading_minute(tick["timestamp"], trade_date)
+        if updates_chart:
+            minute_tick = {**tick, "volume": 0, "turnover": 0.0} if is_full_tick_seed else tick
+            state["minute_bars"] = upsert_minute_bar(state["minute_bars"], minute_tick, trade_date)
         state["last_tick"] = tick
-        state["freshness"] = realtime_freshness(state, raw_event, trade_date)
+        state["freshness"] = realtime_freshness(state, raw_event, trade_date, updates_minute_bars=updates_chart)
 
         alert = None
         bod = self.bod_by_symbol.get(symbol)
@@ -878,6 +881,8 @@ def to_minute_bars(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     bars: list[dict[str, Any]] = []
     previous_close: float | None = None
     for row in rows:
+        if not is_regular_hk_trading_minute(str(row["bar_ts"]), str(row.get("trade_date") or "")):
+            continue
         close = float(row["close"])
         direction = "flat"
         if previous_close is not None:
@@ -1002,8 +1007,14 @@ def safe_alert_id_part(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "-", value).strip("-") or "unknown"
 
 
-def upsert_minute_bar(minute_bars: list[dict[str, Any]], tick: dict[str, Any]) -> list[dict[str, Any]]:
+def upsert_minute_bar(
+    minute_bars: list[dict[str, Any]],
+    tick: dict[str, Any],
+    trade_date: str | None = None,
+) -> list[dict[str, Any]]:
     minute_ts = minute_bucket(tick["timestamp"])
+    if not is_regular_hk_trading_minute(minute_ts, trade_date):
+        return minute_bars[-420:]
     for index, previous in enumerate(minute_bars):
         if minute_bucket(str(previous["timestamp"])) != minute_ts:
             continue
@@ -1090,11 +1101,18 @@ def merge_broker_queue(
     }
 
 
-def realtime_freshness(state: dict[str, Any], raw_event: dict[str, Any], trade_date: str) -> dict[str, Any]:
+def realtime_freshness(
+    state: dict[str, Any],
+    raw_event: dict[str, Any],
+    trade_date: str,
+    *,
+    updates_minute_bars: bool = True,
+) -> dict[str, Any]:
     existing = state.get("freshness") if isinstance(state.get("freshness"), dict) else {}
     source_dates = dict(existing.get("source_dates") or {})
     if raw_event.get("kind") == "tick":
-        source_dates["minute_bars"] = trade_date
+        if updates_minute_bars:
+            source_dates["minute_bars"] = trade_date
         source_dates["realtime"] = trade_date
     elif raw_event.get("kind") == "broker_queue":
         source_dates["broker_queue"] = trade_date

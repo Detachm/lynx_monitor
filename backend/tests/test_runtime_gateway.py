@@ -574,6 +574,53 @@ class RuntimeGatewayTest(unittest.TestCase):
         self.assertEqual(minute_bars[1]["timestamp"], "2026-05-22T09:31:00+08:00")
         self.assertEqual(minute_bars[1]["volume"], 300)
 
+    def test_symbol_runtime_filters_cross_day_and_preopen_realtime_ticks_from_bars(self) -> None:
+        payload = snapshot_payload()
+        manager = SymbolRuntimeManager(
+            FakeSymbolGateway(),
+            trade_date="20260522",
+            hydrate_symbol=lambda symbol: payload,
+        )
+        manager.attach("00700.HK", "client-1")
+
+        manager.apply_terminal_message(
+            terminal_tick_message(
+                "00700.HK",
+                timestamp="2026-05-21T16:00:00+08:00",
+                price=387.0,
+                volume=100,
+                turnover=38700,
+            )
+        )
+        manager.apply_terminal_message(
+            terminal_tick_message(
+                "00700.HK",
+                timestamp="2026-05-22T09:20:00+08:00",
+                price=387.5,
+                volume=200,
+                turnover=77500,
+            )
+        )
+        manager.apply_terminal_message(
+            terminal_tick_message(
+                "00700.HK",
+                timestamp="2026-05-22T09:31:01+08:00",
+                price=388.5,
+                volume=300,
+                turnover=116550,
+            )
+        )
+
+        minute_bars = manager.runtimes["00700.HK"].snapshot_payload["minute_bars"]
+
+        self.assertEqual(
+            [bar["timestamp"] for bar in minute_bars],
+            [
+                "2026-05-22T09:30:00+08:00",
+                "2026-05-22T09:31:00+08:00",
+            ],
+        )
+
     def test_symbol_runtime_applies_processed_snapshot_without_gateway_terminal_conversion(self) -> None:
         payload = snapshot_payload()
         manager = SymbolRuntimeManager(

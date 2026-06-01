@@ -12,6 +12,7 @@ import type {
   MarketMessage,
   MarketPerformanceSample,
   MarketPerformanceSampleHandler,
+  MarketSnapshot,
   MarketState,
   PriceTick,
   StockSymbol,
@@ -291,7 +292,7 @@ export const useMarketStore = defineStore('market', {
         switch (message.type) {
           case 'snapshot':
             state.snapshot = message.snapshot
-            state.ticks = canonicalizeMinuteTicks(message.ticks)
+            state.ticks = canonicalizeMinuteTicks(message.ticks, tradeDateForMessage(message.snapshot, message.freshness))
             state.alerts = message.alerts.slice(0, MAX_ALERTS_PER_SYMBOL)
             state.askQueues = message.askQueues
             state.bidQueues = message.bidQueues
@@ -304,7 +305,9 @@ export const useMarketStore = defineStore('market', {
             if (message.snapshot) {
               state.snapshot = message.snapshot
             }
-            state.ticks = upsertMinuteTick(state.ticks, message.tick)
+            if (isRegularSessionTick(message.tick, tradeDateForMessage(message.snapshot ?? state.snapshot, message.freshness ?? state.freshness ?? undefined))) {
+              state.ticks = upsertMinuteTick(state.ticks, message.tick)
+            }
             if (message.freshness) {
               state.freshness = message.freshness
             }
@@ -434,6 +437,9 @@ function recordPerformanceSample(sample: MarketPerformanceSample) {
 
 function upsertMinuteTick(existing: PriceTick[], tick: PriceTick): PriceTick[] {
   const minuteTimestamp = minuteBucket(tick.timestamp)
+  if (!isRegularSessionMinute(minuteTimestamp)) {
+    return existing.slice(-MAX_TICKS_PER_SYMBOL)
+  }
   const index = existing.findIndex((item) => minuteBucket(item.timestamp) === minuteTimestamp)
   if (index < 0) {
     return [...existing, { ...tick, timestamp: minuteTimestamp }]
@@ -458,8 +464,10 @@ function upsertMinuteTick(existing: PriceTick[], tick: PriceTick): PriceTick[] {
     .slice(-MAX_TICKS_PER_SYMBOL)
 }
 
-function canonicalizeMinuteTicks(ticks: PriceTick[]): PriceTick[] {
-  return ticks.reduce<PriceTick[]>((merged, tick) => upsertMinuteTick(merged, tick), [])
+function canonicalizeMinuteTicks(ticks: PriceTick[], tradeDate?: string): PriceTick[] {
+  return ticks
+    .filter((tick) => isRegularSessionTick(tick, tradeDate))
+    .reduce<PriceTick[]>((merged, tick) => upsertMinuteTick(merged, tick), [])
 }
 
 function minuteBucket(timestamp: string): string {
@@ -484,6 +492,33 @@ function formatHongKongMinute(date: Date): string {
   const hour = String(shifted.getUTCHours()).padStart(2, '0')
   const minute = String(shifted.getUTCMinutes()).padStart(2, '0')
   return `${year}-${month}-${day}T${hour}:${minute}:00+08:00`
+}
+
+function tradeDateForMessage(
+  snapshot: MarketSnapshot | null | undefined,
+  freshness: { effectiveTradeDate?: string; requestedTradeDate?: string } | null | undefined,
+): string | undefined {
+  return freshness?.effectiveTradeDate ?? freshness?.requestedTradeDate ?? snapshot?.tradeDate ?? snapshot?.requestedTradeDate
+}
+
+function isRegularSessionTick(tick: PriceTick, tradeDate?: string): boolean {
+  return isRegularSessionMinute(minuteBucket(tick.timestamp), tradeDate)
+}
+
+function isRegularSessionMinute(timestamp: string, tradeDate?: string): boolean {
+  const match = minuteBucket(timestamp).match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/)
+  if (!match) {
+    return false
+  }
+  const [, year, month, day, hourText, minuteText] = match
+  if (tradeDate && `${year}${month}${day}` !== tradeDate) {
+    return false
+  }
+  const minuteOfDay = Number(hourText) * 60 + Number(minuteText)
+  return (
+    (9 * 60 + 30 <= minuteOfDay && minuteOfDay < 12 * 60) ||
+    (13 * 60 <= minuteOfDay && minuteOfDay <= 16 * 60)
+  )
 }
 
 function loadPersistedWatchlist(): StockSymbol[] {

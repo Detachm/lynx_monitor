@@ -189,6 +189,40 @@ class BackendV2PipelineTest(unittest.TestCase):
         self.assertEqual(cached["freshness"]["source_dates"]["minute_bars"], "20260525")
         self.assertEqual(processed[0]["payload"]["freshness"]["runtime_state"], "LIVE")
 
+    def test_preopen_ticks_do_not_pollute_minute_bars(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_silver_tables(root)
+
+            octopus = OctopusComputeV2(
+                MammothAPI(root),
+                InMemoryEventBus(),
+                InMemoryRedisSnapshotCache(),
+            )
+            snapshot = octopus.preload_bod("00700.HK", "20260522")
+
+            octopus.process_raw_event(
+                make_raw_market_event(
+                    kind="tick",
+                    symbol="00700.HK",
+                    source="xtquant",
+                    seq=1,
+                    source_ts="2026-05-22T09:20:00+08:00",
+                    payload={"price": 388.9, "volume": 1000, "turnover": 388900, "side": "buy"},
+                ),
+                "20260522",
+            )
+
+        self.assertEqual(
+            [bar["timestamp"] for bar in snapshot["minute_bars"]],
+            [
+                "2026-05-22T09:30:00+08:00",
+                "2026-05-22T09:31:00+08:00",
+            ],
+        )
+        self.assertEqual(snapshot["snapshot"]["price"], 388.9)
+        self.assertEqual(snapshot["freshness"]["source_dates"]["minute_bars"], "20260522")
+
     def test_octopus_marks_redis_degraded_without_blocking_snapshot_or_realtime_processing(self) -> None:
         class FailingTerminalCache(InMemoryRedisSnapshotCache):
             def set_terminal_snapshot(self, trade_date: str, symbol: str, snapshot: dict) -> None:
