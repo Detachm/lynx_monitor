@@ -239,6 +239,38 @@ describe('WebSocketDataSource subscribe acknowledgements', () => {
     await expect(subscribed).rejects.toThrow('hydrate failed')
   })
 
+  it('only rejects the oldest pending subscribe when the gateway returns a subscribe error', async () => {
+    const sockets = installFakeWebSocket()
+    const source = new WebSocketDataSource('ws://localhost:9020/ws', 'terminal-message-v1', 50)
+    const connected = source.connect()
+    sockets[0]!.open()
+    await connected
+
+    const firstSubscribed = source.subscribe('700')
+    const secondSubscribed = source.subscribe('939')
+    sockets[0]!.message(
+      JSON.stringify({
+        schema_version: 1,
+        type: 'error',
+        source: 'gateway',
+        payload: { message: 'hydrate failed' },
+      }),
+    )
+
+    await expect(firstSubscribed).rejects.toThrow('hydrate failed')
+
+    let secondResolved = false
+    const trackedSecondSubscribe = secondSubscribed.then(() => {
+      secondResolved = true
+    })
+    await Promise.resolve()
+    expect(secondResolved).toBe(false)
+
+    sockets[0]!.message(snapshotFrame('00939.HK'))
+    await trackedSecondSubscribe
+    expect(secondResolved).toBe(true)
+  })
+
   it('rejects a pending subscribe when the symbol is unsubscribed before snapshot ack', async () => {
     const sockets = installFakeWebSocket()
     const source = new WebSocketDataSource('ws://localhost:9020/ws', 'terminal-message-v1', 50)
@@ -264,6 +296,8 @@ describe('WebSocketDataSource subscribe acknowledgements', () => {
     vi.useFakeTimers()
     const sockets = installFakeWebSocket()
     const source = new WebSocketDataSource('ws://localhost:9020/ws', 'terminal-message-v1', 50, 'desk-a', 10, 100)
+    const statuses: Array<[string, string | null]> = []
+    source.onConnectionStatus((status, error) => statuses.push([status, error]))
     const connected = source.connect()
     sockets[0]!.open()
     await connected
@@ -277,6 +311,13 @@ describe('WebSocketDataSource subscribe acknowledgements', () => {
     sockets[1]!.open()
     await Promise.resolve()
 
+    expect(statuses).toEqual([
+      ['connecting', null],
+      ['connected', null],
+      ['error', 'WebSocket connection closed'],
+      ['connecting', null],
+      ['connected', null],
+    ])
     expect(JSON.parse(sockets[1]!.sent[0]!)).toMatchObject({
       action: 'subscribe',
       symbol: '00700.HK',

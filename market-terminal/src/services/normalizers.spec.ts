@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
 import { isTerminalMessageV1, normalizeMarketMessage, normalizeTerminalMessage } from '@/services/normalizers'
-import type { QueueRealtimeMessage, SnapshotMessage } from '@/types/market'
+import type { SnapshotMessage, TickRealtimeMessage, QueueRealtimeMessage } from '@/types/market'
 
 describe('normalizeMarketMessage', () => {
   it('projects TerminalMessage v1 snapshot payloads into frontend state messages', () => {
@@ -149,6 +149,85 @@ describe('normalizeMarketMessage', () => {
         participantName: '未披露',
         brokerName: '未披露',
       },
+    })
+  })
+
+  it('uses envelope source timestamps for realtime payloads without fabricating local time', () => {
+    const message = normalizeTerminalMessage({
+      schema_version: 1,
+      type: 'tick_realtime',
+      event_id: 'tick-00700.HK-2',
+      symbol: '00700.HK',
+      source: 'gateway',
+      source_ts: '2026-05-22T09:31:00.000+08:00',
+      ingest_ts: '2026-05-22T09:31:00.020+08:00',
+      seq: 4,
+      payload: {
+        tick: {
+          price: 388.5,
+          volume: 1000,
+        },
+      },
+    }) as TickRealtimeMessage
+
+    expect(message.type).toBe('tick_realtime')
+    expect(message.tick.timestamp).toBe('2026-05-22T09:31:00.000+08:00')
+  })
+
+  it('filters snapshot timeline rows that do not carry their own timestamps', () => {
+    const message = normalizeTerminalMessage({
+      schema_version: 1,
+      type: 'snapshot',
+      event_id: 'snapshot-00700.HK-2',
+      symbol: '00700.HK',
+      source: 'gateway',
+      source_ts: '2026-05-22T09:31:00.000+08:00',
+      ingest_ts: '2026-05-22T09:31:00.020+08:00',
+      seq: 5,
+      payload: {
+        snapshot: { price: 388.4 },
+        minute_bars: [
+          { price: 388.4 },
+          { timestamp: '2026-05-22T09:30:00.000+08:00', price: 388.5 },
+        ],
+        alerts: [
+          { id: 'missing-time', price: 388.6, volume: 1000 },
+          { timestamp: '2026-05-22T09:30:30.000+08:00', price: 388.7, volume: 2000 },
+        ],
+        broker_queue: { ask: [], bid: [] },
+        ccass_holdings: [],
+        freshness: { updated_at: '2026-05-22T09:31:00.020+08:00' },
+      },
+    }) as SnapshotMessage
+
+    expect(message.ticks).toHaveLength(1)
+    expect(message.ticks[0]?.timestamp).toBe('2026-05-22T09:30:00.000+08:00')
+    expect(message.alerts).toHaveLength(1)
+    expect(message.alerts[0]?.timestamp).toBe('2026-05-22T09:30:30.000+08:00')
+  })
+
+  it('filters holding history rows without valid trade dates', () => {
+    const message = normalizeTerminalMessage({
+      schema_version: 1,
+      type: 'holding_name_click_response',
+      event_id: 'holding-history-00700.HK-2',
+      symbol: '00700.HK',
+      source: 'gateway',
+      source_ts: '2026-05-22T09:31:00.000+08:00',
+      ingest_ts: '2026-05-22T09:31:00.020+08:00',
+      seq: 6,
+      payload: {
+        participant_name: 'JPMorgan',
+        days: 7,
+        history: [
+          { shares: 1000, percent: 1.2 },
+          { date: '20260522', shares: 1100, percent: 1.3 },
+        ],
+      },
+    })
+
+    expect(message).toMatchObject({
+      history: [{ date: '20260522', shares: 1100 }],
     })
   })
 

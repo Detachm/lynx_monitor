@@ -290,6 +290,8 @@ export type MarketMessageHandler = (message: MarketMessage) => void
 
 export type TerminalHealthHandler = (health: TerminalHealthStatus) => void
 
+export type ConnectionStatusHandler = (status: ConnectionStatus, error: string | null) => void
+
 export interface MarketPerformanceSample {
   key: 'frontend_store_update_ms' | string
   valueMs: number
@@ -308,6 +310,7 @@ export interface MarketDataSource {
   requestHoldingHistory(symbol: StockSymbol, participantName: string, days: number): Promise<void> | void
   onMessage(handler: MarketMessageHandler): () => void
   onHealth?(handler: TerminalHealthHandler): () => void
+  onConnectionStatus?(handler: ConnectionStatusHandler): () => void
 }
 
 export interface MarketState {

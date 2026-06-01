@@ -453,6 +453,11 @@ class MammothAPI:
     def _read_table(self, data_type: str) -> list[dict[str, Any]]:
         return self.reader.read_table(data_type)
 
+    def invalidate_caches(self) -> None:
+        self._participant_history_cache.clear()
+        self._rows_by_symbol_cache.clear()
+        self._rows_by_symbol_date_cache.clear()
+
     def _rows_for_symbol(self, data_type: str, symbol: str) -> list[dict[str, Any]]:
         rows_by_symbol = self._rows_by_symbol_cache.get(data_type)
         if rows_by_symbol is None:

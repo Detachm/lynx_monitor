@@ -1,6 +1,7 @@
 import type {
   BigTradeAlert,
   BrokerQueueEntry,
+  ConnectionStatusHandler,
   HoldingEntry,
   HoldingHistoryPoint,
   MarketDataSource,
@@ -154,6 +155,7 @@ const PARTICIPANTS: ParticipantProfile[] = [
 
 export class MockDataSource implements MarketDataSource {
   private readonly handlers = new Set<MarketMessageHandler>()
+  private readonly connectionHandlers = new Set<ConnectionStatusHandler>()
   private readonly health = new TerminalHealthTracker()
   private readonly runtimes = new Map<StockSymbol, MockRuntime>()
   private readonly intervals = new Map<StockSymbol, ReturnType<typeof globalThis.setInterval>>()
@@ -163,6 +165,7 @@ export class MockDataSource implements MarketDataSource {
 
   async connect() {
     this.connected = true
+    this.notifyConnectionStatus('connected')
     this.health.update({
       process: 'running',
       kafka: 'connected',
@@ -177,6 +180,7 @@ export class MockDataSource implements MarketDataSource {
       globalThis.clearInterval(interval)
     }
     this.intervals.clear()
+    this.notifyConnectionStatus('disconnected')
     this.health.update({ process: 'stopped' })
   }
 
@@ -238,6 +242,17 @@ export class MockDataSource implements MarketDataSource {
 
   onHealth(handler: TerminalHealthHandler) {
     return this.health.onHealth(handler)
+  }
+
+  onConnectionStatus(handler: ConnectionStatusHandler) {
+    this.connectionHandlers.add(handler)
+    return () => this.connectionHandlers.delete(handler)
+  }
+
+  private notifyConnectionStatus(status: 'connected' | 'disconnected') {
+    for (const handler of this.connectionHandlers) {
+      handler(status, null)
+    }
   }
 
   emitNext(rawSymbol: StockSymbol) {

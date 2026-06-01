@@ -145,11 +145,11 @@ function normalizeSnapshotMessage(symbol: string, raw: JsonRecord): SnapshotMess
   return {
     type: 'snapshot',
     symbol,
-    snapshot: normalizeSnapshot(symbol, snapshotRecord),
-    ticks: arrayValue(raw.minute_bars ?? raw.ticks ?? raw.minute_ticks).map((item, index) =>
+    snapshot: normalizeSnapshot(symbol, snapshotRecord, timestampValue(raw.source_ts ?? raw.sourceTs)),
+    ticks: compactMap(arrayValue(raw.minute_bars ?? raw.ticks ?? raw.minute_ticks), (item, index) =>
       normalizeTick(recordValue(item) ?? {}, index),
     ),
-    alerts: arrayValue(raw.alerts ?? raw.large_trades).map((item, index) =>
+    alerts: compactMap(arrayValue(raw.alerts ?? raw.large_trades), (item, index) =>
       normalizeAlert(recordValue(item) ?? {}, index),
     ),
     askQueues: normalizeQueueArray(raw.askQueues ?? raw.ask_queues ?? brokerQueue?.ask, 'ask'),
@@ -157,29 +157,39 @@ function normalizeSnapshotMessage(symbol: string, raw: JsonRecord): SnapshotMess
     holding: arrayValue(raw.ccass_holdings ?? raw.holding ?? raw.holdings).map((item, index) =>
       normalizeHolding(recordValue(item) ?? {}, index),
     ),
-    freshness: normalizeFreshness(recordValue(raw.freshness) ?? {}),
+    freshness: normalizeFreshness(recordValue(raw.freshness) ?? {}, timestampValue(raw.source_ts ?? raw.sourceTs)),
   }
 }
 
-function normalizeTickMessage(symbol: string, raw: JsonRecord): TickRealtimeMessage {
+function normalizeTickMessage(symbol: string, raw: JsonRecord): TickRealtimeMessage | null {
   const tickRecord = recordValue(raw.tick) ?? raw
   const snapshotRecord = recordValue(raw.snapshot)
+  const fallbackTimestamp = timestampValue(raw.source_ts ?? raw.sourceTs)
+  const tick = normalizeTick(tickRecord, 0, fallbackTimestamp)
+  if (!tick) {
+    return null
+  }
   return {
     type: 'tick_realtime',
     symbol,
-    tick: normalizeTick(tickRecord, 0),
-    snapshot: snapshotRecord ? normalizeSnapshot(symbol, snapshotRecord) : undefined,
-    freshness: recordValue(raw.freshness) ? normalizeFreshness(recordValue(raw.freshness) ?? {}) : undefined,
+    tick,
+    snapshot: snapshotRecord ? normalizeSnapshot(symbol, snapshotRecord, fallbackTimestamp) : undefined,
+    freshness: recordValue(raw.freshness) ? normalizeFreshness(recordValue(raw.freshness) ?? {}, fallbackTimestamp) : undefined,
   }
 }
 
-function normalizeAlertMessage(symbol: string, raw: JsonRecord): AlertRealtimeMessage {
+function normalizeAlertMessage(symbol: string, raw: JsonRecord): AlertRealtimeMessage | null {
   const alertRecord = recordValue(raw.alert) ?? raw
+  const fallbackTimestamp = timestampValue(raw.source_ts ?? raw.sourceTs)
+  const alert = normalizeAlert(alertRecord, 0, fallbackTimestamp)
+  if (!alert) {
+    return null
+  }
   return {
     type: 'alert_realtime',
     symbol,
-    alert: normalizeAlert(alertRecord, 0),
-    freshness: recordValue(raw.freshness) ? normalizeFreshness(recordValue(raw.freshness) ?? {}) : undefined,
+    alert,
+    freshness: recordValue(raw.freshness) ? normalizeFreshness(recordValue(raw.freshness) ?? {}, fallbackTimestamp) : undefined,
   }
 }
 
@@ -190,7 +200,9 @@ function normalizeQueueMessage(symbol: string, raw: JsonRecord): QueueRealtimeMe
     type: 'queue_realtime',
     symbol,
     side,
-    freshness: recordValue(raw.freshness) ? normalizeFreshness(recordValue(raw.freshness) ?? {}) : undefined,
+    freshness: recordValue(raw.freshness)
+      ? normalizeFreshness(recordValue(raw.freshness) ?? {}, timestampValue(raw.source_ts ?? raw.sourceTs))
+      : undefined,
   }
 
   if (raw.askQueues || raw.ask_queues || brokerQueue?.ask || side === 'ask') {
@@ -219,14 +231,16 @@ function normalizeHoldingHistoryMessage(symbol: string, raw: JsonRecord): Holdin
     symbol,
     participantName,
     days,
-    history: arrayValue(raw.history ?? raw.data).map((item, index) =>
+    history: compactMap(arrayValue(raw.history ?? raw.data), (item, index) =>
       normalizeHistoryPoint(recordValue(item) ?? {}, index),
     ),
-    freshness: recordValue(raw.freshness) ? normalizeFreshness(recordValue(raw.freshness) ?? {}) : undefined,
+    freshness: recordValue(raw.freshness)
+      ? normalizeFreshness(recordValue(raw.freshness) ?? {}, timestampValue(raw.source_ts ?? raw.sourceTs))
+      : undefined,
   }
 }
 
-function normalizeSnapshot(symbol: string, raw: JsonRecord): MarketSnapshot {
+function normalizeSnapshot(symbol: string, raw: JsonRecord, fallbackTimestamp?: string | null): MarketSnapshot {
   const price = numberValue(raw.price ?? raw.last_price ?? raw.last) || 0
   const previousClose = numberValue(raw.previousClose ?? raw.previous_close ?? raw.prev_close) || price
   const change = numberValue(raw.change) || price - previousClose
@@ -250,18 +264,20 @@ function normalizeSnapshot(symbol: string, raw: JsonRecord): MarketSnapshot {
     turnover: numberValue(raw.turnover) || 0,
     change,
     changePercent,
-    updatedAt: stringValue(raw.updatedAt ?? raw.updated_at ?? raw.timestamp) ?? new Date().toISOString(),
+    updatedAt: timestampValue(raw.updatedAt ?? raw.updated_at ?? raw.timestamp, fallbackTimestamp) ?? new Date(0).toISOString(),
   }
 }
 
-function normalizeTick(raw: JsonRecord, index: number): PriceTick {
+function normalizeTick(raw: JsonRecord, index: number, fallbackTimestamp?: string | null): PriceTick | null {
+  const timestamp = timestampValue(raw.timestamp ?? raw.time ?? raw.datetime, fallbackTimestamp)
+  if (!timestamp) {
+    return null
+  }
   const price = numberValue(raw.price ?? raw.last_price) || 0
   const volume = numberValue(raw.volume ?? raw.qty ?? raw.quantity) || 0
 
   return {
-    timestamp:
-      stringValue(raw.timestamp ?? raw.time ?? raw.datetime) ??
-      new Date(Date.now() + index * 1000).toISOString(),
+    timestamp,
     price,
     volume,
     turnover: numberValue(raw.turnover) || price * volume,
@@ -269,16 +285,18 @@ function normalizeTick(raw: JsonRecord, index: number): PriceTick {
   }
 }
 
-function normalizeAlert(raw: JsonRecord, index: number): BigTradeAlert {
+function normalizeAlert(raw: JsonRecord, index: number, fallbackTimestamp?: string | null): BigTradeAlert | null {
   const participantName = participantDisplayName(raw.participantName ?? raw.participant_name ?? raw.participant)
+  const timestamp = timestampValue(raw.timestamp ?? raw.time ?? raw.datetime, fallbackTimestamp)
+  if (!timestamp) {
+    return null
+  }
   const price = numberValue(raw.price ?? raw.last_price) || 0
   const volume = numberValue(raw.volume ?? raw.qty ?? raw.quantity) || 0
 
   return {
-    id: stringValue(raw.id) ?? `alert-${Date.now()}-${index}`,
-    timestamp:
-      stringValue(raw.timestamp ?? raw.time ?? raw.datetime) ??
-      new Date(Date.now() + index * 1000).toISOString(),
+    id: stringValue(raw.id) ?? `alert-${timestamp}-${price}-${volume}-${index}`,
+    timestamp,
     price,
     volume,
     turnover: numberValue(raw.turnover ?? raw.amount) || price * volume,
@@ -294,14 +312,16 @@ function normalizeAlert(raw: JsonRecord, index: number): BigTradeAlert {
 function normalizeQueueArray(input: unknown, side: QueueSide): BrokerQueueEntry[] {
   return arrayValue(input).map((item, index) => {
     const raw = recordValue(item) ?? {}
+    const position = numberValue(raw.position ?? raw.rank) || index + 1
+    const brokerCode = queueBrokerCode(raw.brokerCode ?? raw.broker_code ?? raw.code)
     return {
-      id: stringValue(raw.id) ?? `${side}-${Date.now()}-${index}`,
-      position: numberValue(raw.position ?? raw.rank) || index + 1,
+      id: stringValue(raw.id) ?? `${side}-${position}-${brokerCode}-${index}`,
+      position,
       side,
       participantName: participantDisplayName(
         raw.participantName ?? raw.participant_name ?? raw.participant ?? raw.brokerName ?? raw.broker_name,
       ),
-      brokerCode: queueBrokerCode(raw.brokerCode ?? raw.broker_code ?? raw.code),
+      brokerCode,
       price: numberValue(raw.price) || 0,
       volume: numberValue(raw.volume ?? raw.qty ?? raw.quantity) || 0,
     }
@@ -344,16 +364,20 @@ function normalizeHolding(raw: JsonRecord, index: number): HoldingEntry {
   }
 }
 
-function normalizeHistoryPoint(raw: JsonRecord, index: number): HoldingHistoryPoint {
+function normalizeHistoryPoint(raw: JsonRecord, _index: number): HoldingHistoryPoint | null {
+  const date = dateValue(raw.date)
+  if (!date) {
+    return null
+  }
   return {
-    date: stringValue(raw.date) ?? new Date(Date.now() - index * 86_400_000).toISOString().slice(0, 10),
+    date,
     shares: numberValue(raw.shares ?? raw.holding ?? raw.volume) || 0,
     percent: numberValue(raw.percent ?? raw.ratio) || 0,
     change: numberValue(raw.change ?? raw.delta) || 0,
   }
 }
 
-function normalizeFreshness(raw: JsonRecord): FreshnessPayload {
+function normalizeFreshness(raw: JsonRecord, fallbackTimestamp?: string | null): FreshnessPayload {
   const degradedReason = stringValue(raw.degradedReason ?? raw.degraded_reason) ?? undefined
   const degradedReasons = arrayValue(raw.degradedReasons ?? raw.degraded_reasons)
     .filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
@@ -364,9 +388,9 @@ function normalizeFreshness(raw: JsonRecord): FreshnessPayload {
   const sourceDates = recordValue(raw.sourceDates ?? raw.source_dates)
 
   return {
-    updatedAt: stringValue(raw.updatedAt ?? raw.updated_at) ?? new Date().toISOString(),
-    sourceTs: stringValue(raw.sourceTs ?? raw.source_ts) ?? undefined,
-    ingestTs: stringValue(raw.ingestTs ?? raw.ingest_ts) ?? undefined,
+    updatedAt: timestampValue(raw.updatedAt ?? raw.updated_at, fallbackTimestamp) ?? new Date(0).toISOString(),
+    sourceTs: timestampValue(raw.sourceTs ?? raw.source_ts) ?? undefined,
+    ingestTs: timestampValue(raw.ingestTs ?? raw.ingest_ts) ?? undefined,
     degraded: booleanValue(raw.degraded) ?? degradedReasons.length > 0,
     degradedReason,
     degradedReasons,
@@ -406,8 +430,34 @@ function arrayValue(input: unknown): unknown[] {
   return Array.isArray(input) ? input : []
 }
 
+function compactMap<TInput, TOutput>(
+  items: TInput[],
+  mapper: (item: TInput, index: number) => TOutput | null | undefined,
+): TOutput[] {
+  return items.flatMap((item, index) => {
+    const mapped = mapper(item, index)
+    return mapped ? [mapped] : []
+  })
+}
+
 function stringValue(input: unknown): string | null {
   return typeof input === 'string' && input.trim() ? input.trim() : null
+}
+
+function timestampValue(input: unknown, fallback?: string | null): string | null {
+  const value = stringValue(input)
+  if (value && isIsoDateTime(value)) {
+    return value
+  }
+  return fallback && isIsoDateTime(fallback) ? fallback : null
+}
+
+function dateValue(input: unknown): string | null {
+  const value = stringValue(input)
+  if (!value) {
+    return null
+  }
+  return /^\d{4}-\d{2}-\d{2}$/.test(value) || /^\d{8}$/.test(value) ? value : null
 }
 
 function isNonEmptyString(input: unknown): input is string {

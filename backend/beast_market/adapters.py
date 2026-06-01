@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 import json
 from pathlib import Path
 import re
+import threading
 from typing import Any, Protocol
 
 from .contracts import CANONICAL_SYMBOL_PATTERN, PROCESSED_TOPIC, RAW_TOPIC, now_iso
@@ -539,37 +540,41 @@ class BoundedRawEventQueue:
         self.items: deque[dict[str, Any]] = deque()
         self.coalesced_items: dict[str, dict[str, Any]] = {}
         self.dropped: list[dict[str, Any]] = []
+        self._lock = threading.RLock()
 
     def push(self, event: dict[str, Any]) -> bool:
-        coalesce_key = raw_event_queue_coalesce_key(event)
-        if coalesce_key and coalesce_key in self.coalesced_items:
-            self.coalesced_items[coalesce_key] = event
+        with self._lock:
+            coalesce_key = raw_event_queue_coalesce_key(event)
+            if coalesce_key and coalesce_key in self.coalesced_items:
+                self.coalesced_items[coalesce_key] = event
+                return True
+            if len(self.items) >= self.max_size:
+                self.dropped.append(event)
+                return False
+            if coalesce_key:
+                self.coalesced_items[coalesce_key] = event
+                self.items.append({"__coalesce_key__": coalesce_key})
+            else:
+                self.items.append(event)
             return True
-        if len(self.items) >= self.max_size:
-            self.dropped.append(event)
-            return False
-        if coalesce_key:
-            self.coalesced_items[coalesce_key] = event
-            self.items.append({"__coalesce_key__": coalesce_key})
-        else:
-            self.items.append(event)
-        return True
 
     def pop(self) -> dict[str, Any] | None:
-        while self.items:
-            event = self.items.popleft()
-            coalesce_key = event.get("__coalesce_key__")
-            if isinstance(coalesce_key, str):
-                coalesced = self.coalesced_items.pop(coalesce_key, None)
-                if coalesced is None:
-                    continue
-                return coalesced
-            return event
-        return None
+        with self._lock:
+            while self.items:
+                event = self.items.popleft()
+                coalesce_key = event.get("__coalesce_key__")
+                if isinstance(coalesce_key, str):
+                    coalesced = self.coalesced_items.pop(coalesce_key, None)
+                    if coalesced is None:
+                        continue
+                    return coalesced
+                return event
+            return None
 
     @property
     def backlog(self) -> int:
-        return len(self.items)
+        with self._lock:
+            return len(self.items)
 
 
 def raw_event_queue_coalesce_key(event: dict[str, Any]) -> str | None:

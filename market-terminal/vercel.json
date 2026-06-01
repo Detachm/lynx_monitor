@@ -1,6 +1,6 @@
 {
   "framework": "vite",
   "installCommand": "corepack enable && pnpm install --frozen-lockfile",
-  "buildCommand": "corepack enable && pnpm build-only",
+  "buildCommand": "corepack enable && pnpm type-check && pnpm build-only",
   "outputDirectory": "dist"
 }

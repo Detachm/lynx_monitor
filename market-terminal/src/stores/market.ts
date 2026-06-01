@@ -32,6 +32,7 @@ export const SMOKE_MACHINE_ID_STORAGE_KEY = 'market-terminal.smoke.machine-id.v1
 let activeSource: MarketDataSource | null = null
 let removeMessageHandler: (() => void) | null = null
 let removeHealthHandler: (() => void) | null = null
+let removeConnectionStatusHandler: (() => void) | null = null
 let performanceSampleHandler: MarketPerformanceSampleHandler | null = null
 let performanceSamples: MarketPerformanceSample[] = []
 
@@ -113,6 +114,10 @@ export const useMarketStore = defineStore('market', {
         removeHealthHandler = source.onHealth?.((health) => {
           this.health = health
         }) ?? null
+        removeConnectionStatusHandler = source.onConnectionStatus?.((status, error) => {
+          this.connectionStatus = status
+          this.connectionError = error
+        }) ?? null
 
         const persistedSymbols = this.subscribedSymbols.length > 0 ? [] : loadPersistedWatchlist()
         const defaultSymbols = sourceOptions.defaultSymbols?.length ? sourceOptions.defaultSymbols : DEFAULT_SYMBOLS
@@ -142,6 +147,8 @@ export const useMarketStore = defineStore('market', {
       removeMessageHandler = null
       removeHealthHandler?.()
       removeHealthHandler = null
+      removeConnectionStatusHandler?.()
+      removeConnectionStatusHandler = null
 
       const source = activeSource
       if (source) {

@@ -1,4 +1,6 @@
 import type {
+  ConnectionStatus,
+  ConnectionStatusHandler,
   MarketDataSource,
   MarketMessageHandler,
   StockSymbol,
@@ -14,6 +16,7 @@ import { normalizeStockSymbol } from '@/utils/symbol'
 export class WebSocketDataSource implements MarketDataSource {
   private socket: WebSocket | null = null
   private readonly handlers = new Set<MarketMessageHandler>()
+  private readonly connectionHandlers = new Set<ConnectionStatusHandler>()
   private readonly health = new TerminalHealthTracker()
   private readonly desiredSubscriptions = new Set<StockSymbol>()
   private readonly pendingSubscribes = new Map<
@@ -47,6 +50,7 @@ export class WebSocketDataSource implements MarketDataSource {
     }
     this.manuallyDisconnected = false
     this.clearReconnectTimer()
+    this.notifyConnectionStatus('connecting')
 
     this.connectPromise = new Promise((resolve, reject) => {
       const socket = new WebSocket(this.url)
@@ -58,6 +62,7 @@ export class WebSocketDataSource implements MarketDataSource {
           this.connectPromise = null
           this.reconnectAttempts = 0
           this.health.update({ process: 'running' })
+          this.notifyConnectionStatus('connected')
           this.restoreSubscriptions()
           resolve()
         },
@@ -67,8 +72,10 @@ export class WebSocketDataSource implements MarketDataSource {
         'error',
         () => {
           this.connectPromise = null
+          const error = new Error(`Unable to connect to ${this.url}`)
           this.health.update({ process: 'degraded' })
-          reject(new Error(`Unable to connect to ${this.url}`))
+          this.notifyConnectionStatus('error', error.message)
+          reject(error)
           this.scheduleReconnect()
         },
         { once: true },
@@ -76,7 +83,7 @@ export class WebSocketDataSource implements MarketDataSource {
       socket.addEventListener('message', (event) => {
         const error = parseGatewayError(event.data)
         if (error) {
-          this.rejectPendingSubscribes(new Error(error))
+          this.rejectOldestPendingSubscribe(new Error(error))
           this.health.update({ process: 'degraded' })
           return
         }
@@ -105,8 +112,14 @@ export class WebSocketDataSource implements MarketDataSource {
         }
         this.connectPromise = null
         this.rejectPendingSubscribes(new Error('WebSocket connection closed'))
-        this.health.update({ process: 'stopped' })
-        this.scheduleReconnect()
+        if (this.manuallyDisconnected) {
+          this.health.update({ process: 'stopped' })
+          this.notifyConnectionStatus('disconnected')
+        } else {
+          this.health.update({ process: 'degraded' })
+          this.notifyConnectionStatus('error', 'WebSocket connection closed')
+          this.scheduleReconnect()
+        }
       })
     })
     return this.connectPromise
@@ -118,6 +131,7 @@ export class WebSocketDataSource implements MarketDataSource {
     this.socket?.close()
     this.socket = null
     this.rejectPendingSubscribes(new Error('WebSocket connection closed'))
+    this.notifyConnectionStatus('disconnected')
   }
 
   subscribe(rawSymbol: StockSymbol) {
@@ -185,6 +199,11 @@ export class WebSocketDataSource implements MarketDataSource {
 
   onHealth(handler: TerminalHealthHandler) {
     return this.health.onHealth(handler)
+  }
+
+  onConnectionStatus(handler: ConnectionStatusHandler) {
+    this.connectionHandlers.add(handler)
+    return () => this.connectionHandlers.delete(handler)
   }
 
   private send(payload: object) {
@@ -257,6 +276,19 @@ export class WebSocketDataSource implements MarketDataSource {
     globalThis.clearTimeout(pending.timer)
     this.pendingSubscribes.delete(symbol)
     pending.reject(error)
+  }
+
+  private rejectOldestPendingSubscribe(error: Error) {
+    const firstSymbol = this.pendingSubscribes.keys().next().value
+    if (firstSymbol) {
+      this.rejectPendingSubscribe(firstSymbol, error)
+    }
+  }
+
+  private notifyConnectionStatus(status: ConnectionStatus, error: string | null = null) {
+    for (const handler of this.connectionHandlers) {
+      handler(status, error)
+    }
   }
 }
 

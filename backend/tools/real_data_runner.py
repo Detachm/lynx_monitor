@@ -579,6 +579,9 @@ def hydrate_real_data_symbol(
     ensure_symbol = getattr(reader, "ensure_symbol", None)
     if callable(ensure_symbol):
         ensure_symbol(symbol)
+        invalidate_caches = getattr(mammoth, "invalidate_caches", None)
+        if callable(invalidate_caches):
+            invalidate_caches()
     effective_trade_date = mammoth.get_latest_available_trade_date(
         symbol,
         requested_trade_date,
