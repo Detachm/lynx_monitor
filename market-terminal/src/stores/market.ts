@@ -25,6 +25,7 @@ import { isNormalizedStockSymbol, normalizeStockSymbol } from '@/utils/symbol'
 const MAX_TICKS_PER_SYMBOL = 420
 const MAX_ALERTS_PER_SYMBOL = 500
 const MAX_PERFORMANCE_SAMPLES = 1000
+const STARTUP_SUBSCRIPTION_CONCURRENCY = 8
 export const WATCHLIST_STORAGE_KEY = 'market-terminal.watchlist.v1'
 export const SMOKE_MACHINE_ID_STORAGE_KEY = 'market-terminal.smoke.machine-id.v1'
 
@@ -129,13 +130,7 @@ export const useMarketStore = defineStore('market', {
         await source.connect()
         this.connectionStatus = 'connected'
 
-        for (const symbol of symbolsToSubscribe) {
-          try {
-            await this.subscribeSymbol(symbol)
-          } catch {
-            continue
-          }
-        }
+        await runStartupSubscriptions(symbolsToSubscribe, (symbol) => this.subscribeSymbol(symbol))
       } catch (error) {
         this.connectionStatus = 'error'
         this.connectionError = error instanceof Error ? error.message : String(error)
@@ -433,6 +428,29 @@ function recordStoreUpdatePerformanceSample(startedAt: number, message: MarketMe
 function recordPerformanceSample(sample: MarketPerformanceSample) {
   performanceSamples = [...performanceSamples, sample].slice(-MAX_PERFORMANCE_SAMPLES)
   performanceSampleHandler?.(sample)
+}
+
+async function runStartupSubscriptions(
+  symbols: StockSymbol[],
+  subscribe: (symbol: StockSymbol) => Promise<void>,
+): Promise<void> {
+  const queue = [...symbols]
+  const workerCount = Math.min(STARTUP_SUBSCRIPTION_CONCURRENCY, queue.length)
+  await Promise.all(
+    Array.from({ length: workerCount }, async () => {
+      while (queue.length > 0) {
+        const symbol = queue.shift()
+        if (!symbol) {
+          continue
+        }
+        try {
+          await subscribe(symbol)
+        } catch {
+          continue
+        }
+      }
+    }),
+  )
 }
 
 function upsertMinuteTick(existing: PriceTick[], tick: PriceTick): PriceTick[] {

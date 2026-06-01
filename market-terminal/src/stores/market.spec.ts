@@ -83,6 +83,65 @@ describe('market store', () => {
     ])
   })
 
+  it('does not let a slow startup subscription block later watchlist snapshots', async () => {
+    const store = useMarketStore()
+    const started: string[] = []
+    let releaseFirst = () => {}
+    const source = {
+      connect: async () => {},
+      disconnect: async () => {},
+      subscribe: async (symbol: string) => {
+        started.push(symbol)
+        if (symbol === '00700.HK') {
+          await new Promise<void>((resolve) => {
+            releaseFirst = resolve
+          })
+        }
+        store.handleMessage({
+          type: 'snapshot',
+          symbol,
+          snapshot: makeSnapshot(symbol, symbol === '00939.HK' ? 7.4 : 388),
+          ticks: [makeTick(symbol === '00939.HK' ? 7.4 : 388)],
+          alerts: [],
+          askQueues: [],
+          bidQueues: [],
+          holding: [],
+          freshness: {
+            updatedAt: '2026-05-22T09:30:00+08:00',
+            runtimeState: 'WARM',
+            degraded: false,
+            degradedReasons: [],
+            sourceDates: { minute_bars: '20260522' },
+          },
+        })
+      },
+      unsubscribe: async () => {},
+      requestHoldingHistory: async () => {},
+      onMessage: () => () => {},
+      onHealth: () => () => {},
+    }
+
+    const initialized = store.initialize(
+      'mock',
+      { defaultSymbols: ['00700.HK', '00939.HK'] },
+      source,
+    )
+
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    expect(started).toEqual(['00700.HK', '00939.HK'])
+    expect(store.connectionStatus).toBe('connected')
+    expect(store.symbols['00939.HK']!.snapshotLoaded).toBe(true)
+    expect(store.symbols['00939.HK']!.ticks).toHaveLength(1)
+    expect(store.symbols['00700.HK']!.snapshotLoaded).toBe(false)
+
+    releaseFirst?.()
+    await initialized
+
+    expect(store.symbols['00700.HK']!.snapshotLoaded).toBe(true)
+  })
+
   it('stores snapshot, tick, alert, queue, and holding history messages by symbol', async () => {
     const store = useMarketStore()
     await store.subscribeSymbol('00700')
