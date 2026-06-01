@@ -540,6 +540,42 @@ class BackendV2PipelineTest(unittest.TestCase):
             self.assertIsNotNone(update.alert)
             self.assertEqual(update.state["alerts"][0]["id"], update.alert["id"])
 
+    def test_full_tick_seed_updates_snapshot_without_big_trade_alert(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_silver_tables(root)
+
+            octopus = OctopusComputeV2(
+                MammothAPI(root),
+                InMemoryEventBus(),
+                InMemoryRedisSnapshotCache(),
+                big_trade_volume_baseline_ratio=0.00001,
+            )
+            state = octopus.preload_bod("00700.HK", "20260522")
+            initial_alert_count = len(state["alerts"])
+            raw_event = make_raw_market_event(
+                kind="tick",
+                symbol="00700.HK",
+                source="xtquant_full_tick",
+                seq=1,
+                source_ts="2026-05-22T09:32:05+08:00",
+                payload={
+                    "price": 389.4,
+                    "volume": 5_000_000,
+                    "turnover": 1_947_000_000,
+                    "side": "",
+                    "broker_code": "",
+                },
+                period="full_tick",
+            )
+
+            update = octopus.apply_tick_to_state(state, raw_event, "20260522")
+
+            self.assertEqual(update.state["snapshot"]["price"], 389.4)
+            self.assertEqual(update.state["snapshot"]["volume"], 5_000_000)
+            self.assertIsNone(update.alert)
+            self.assertEqual(len(update.state["alerts"]), initial_alert_count)
+
     def test_octopus_apply_broker_queue_to_state_returns_explicit_update(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

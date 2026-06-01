@@ -581,7 +581,7 @@ class OctopusComputeV2:
 
         alert = None
         bod = self.bod_by_symbol.get(symbol)
-        if is_big_trade(tick, bod, self.big_trade_volume_baseline_ratio):
+        if not is_full_tick_seed and is_big_trade(tick, bod, self.big_trade_volume_baseline_ratio):
             alert = make_big_trade_alert(raw_event, tick, bod)
             state["alerts"] = [alert, *state["alerts"]][:500]
         return TickStateUpdate(state=state, tick=tick, alert=alert)
