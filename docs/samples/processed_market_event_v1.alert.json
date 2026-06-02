@@ -17,6 +17,12 @@
       "side": "buy",
       "participantName": "JPMorgan Chase Bank, N.A.",
       "brokerName": "JPMorgan Chase Bank, N.A.",
+      "brokerCode": "JPM",
+      "source_kind": "canonical_trade_tick",
+      "source_table": "trade_ticks",
+      "source_event_id": "tick-row-00700-20260522-093000020",
+      "trade_id": "T-00700-20260522-000001",
+      "row_hash": "tick-row-00700-20260522-093000020",
       "remark": "Aggressive buy",
       "isHighlighted": true
     }

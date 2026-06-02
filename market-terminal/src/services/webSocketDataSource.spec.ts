@@ -27,6 +27,12 @@ describe('parseHealthStatus', () => {
           latest_event_at_by_symbol: {
             '00700.HK': '2026-05-22T09:30:00+08:00',
           },
+          trade_tick_source_available: true,
+          realtime_recovery: {
+            trade_tick_source_available_by_symbol: {
+              '00700.HK': true,
+            },
+          },
           symbol_freshness: {
             '00700.HK': {
               subscribed: true,
@@ -47,6 +53,10 @@ describe('parseHealthStatus', () => {
       kafkaLag: 2,
       latestEventAtBySymbol: {
         '00700.HK': '2026-05-22T09:30:00+08:00',
+      },
+      tradeTickSourceAvailable: true,
+      tradeTickSourceAvailableBySymbol: {
+        '00700.HK': true,
       },
       symbolFreshness: {
         '00700.HK': {

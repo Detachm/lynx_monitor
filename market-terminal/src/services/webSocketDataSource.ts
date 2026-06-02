@@ -329,6 +329,16 @@ export function parseHealthStatus(input: unknown): Partial<Omit<TerminalHealthSt
     payload.latest_event_at_by_symbol ?? payload.latestEventAtBySymbol,
   )
   const symbolFreshness = recordValue(payload.symbol_freshness ?? payload.symbolFreshness)
+  const realtimeRecovery = recordValue(payload.realtime_recovery ?? payload.realtimeRecovery)
+  const tradeTickSourceAvailable = booleanValue(
+    payload.trade_tick_source_available ?? payload.tradeTickSourceAvailable,
+  )
+  const tradeTickSourceAvailableBySymbol = recordValue(
+    payload.trade_tick_source_available_by_symbol ??
+      payload.tradeTickSourceAvailableBySymbol ??
+      realtimeRecovery?.trade_tick_source_available_by_symbol ??
+      realtimeRecovery?.tradeTickSourceAvailableBySymbol,
+  )
 
   return {
     ...(process ? { process } : {}),
@@ -336,6 +346,10 @@ export function parseHealthStatus(input: unknown): Partial<Omit<TerminalHealthSt
     ...(redis ? { redis } : {}),
     ...(kafkaLag !== undefined ? { kafkaLag } : {}),
     ...(latestEventAtBySymbol ? { latestEventAtBySymbol: stringRecord(latestEventAtBySymbol) } : {}),
+    ...(tradeTickSourceAvailable !== null ? { tradeTickSourceAvailable } : {}),
+    ...(tradeTickSourceAvailableBySymbol
+      ? { tradeTickSourceAvailableBySymbol: booleanSymbolRecord(tradeTickSourceAvailableBySymbol) }
+      : {}),
     ...(symbolFreshness ? { symbolFreshness: normalizeSymbolFreshness(symbolFreshness) } : {}),
   }
 }
@@ -390,6 +404,17 @@ function stringRecord(input: Record<string, unknown>): Record<string, string> {
       (entry): entry is [string, string] =>
         isTerminalSymbol(entry[0]) && typeof entry[1] === 'string' && isIsoDateTime(entry[1]),
     ),
+  )
+}
+
+function booleanSymbolRecord(input: Record<string, unknown>): Record<string, boolean> {
+  return Object.fromEntries(
+    Object.entries(input).flatMap(([symbol, value]) => {
+      if (!isTerminalSymbol(symbol) || typeof value !== 'boolean') {
+        return []
+      }
+      return [[symbol, value]]
+    }),
   )
 }
 

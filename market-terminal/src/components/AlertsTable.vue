@@ -4,6 +4,7 @@ import { formatCompactNumber, formatPrice } from '@/utils/format'
 
 defineProps<{
   alerts: BigTradeAlert[]
+  tradeTickSourceAvailable?: boolean
 }>()
 
 function formatTime(timestamp: string): string {
@@ -23,7 +24,10 @@ function formatTime(timestamp: string): string {
         <h2>大额交易</h2>
       </div>
     </header>
-    <div class="table-scroll">
+    <div v-if="alerts.length === 0" class="empty-state">
+      <h2>{{ tradeTickSourceAvailable === false ? '成交明细源不可用' : '暂无大额交易' }}</h2>
+    </div>
+    <div v-else class="table-scroll">
       <table class="data-table">
         <thead>
           <tr>

@@ -22,6 +22,13 @@ const historyParticipant = ref('')
 const historyDays = ref(30)
 
 const activeState = computed(() => market.activeSymbolState)
+const activeTradeTickSourceAvailable = computed(() => {
+  const symbol = market.activeSymbol
+  if (symbol && symbol in market.health.tradeTickSourceAvailableBySymbol) {
+    return market.health.tradeTickSourceAvailableBySymbol[symbol]
+  }
+  return market.health.tradeTickSourceAvailable
+})
 const dataSourceOptions = dataSourceOptionsFromRuntimeConfig(DEFAULT_DATA_SOURCE_CONFIG)
 const historyRows = computed(() =>
   historySymbol.value && historyParticipant.value
@@ -106,7 +113,10 @@ watch(historyDays, async (days) => {
         :snapshot="activeState.snapshot"
         :ticks="activeState.ticks"
       />
-      <AlertsTable :alerts="activeState.alerts" />
+      <AlertsTable
+        :alerts="activeState.alerts"
+        :trade-tick-source-available="activeTradeTickSourceAvailable"
+      />
       <BrokerQueue :ask-queues="activeState.askQueues" :bid-queues="activeState.bidQueues" />
       <HoldingTable :holding="activeState.holding" @participant="openHoldingHistory" />
     </div>

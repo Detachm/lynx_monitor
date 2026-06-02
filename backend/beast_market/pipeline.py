@@ -69,12 +69,14 @@ class TickStateUpdate:
 class BrokerQueueStateUpdate:
     state: dict[str, Any]
     broker_queue: dict[str, list[dict[str, Any]]]
+    applied: bool = True
 
 
 @dataclass
 class L2OrderBookStateUpdate:
     state: dict[str, Any]
     order_book: dict[str, Any]
+    applied: bool = True
 
 
 class RealtimeCollectorV2:
@@ -133,6 +135,12 @@ class RealtimeCollectorV2:
             "trade_type",
             "active_broker_code",
             "broker_code_source",
+            "source_kind",
+            "source_table",
+            "trade_id",
+            "row_hash",
+            "source_event_id",
+            "tick_ts",
         ):
             if optional_key in tick:
                 payload[optional_key] = tick[optional_key]
@@ -235,7 +243,7 @@ class OctopusComputeV2:
         return self.state_by_symbol.get(symbol)
 
     def set_state(self, symbol: str, state: dict[str, Any]) -> dict[str, Any]:
-        self.filter_state_alerts_for_policy(symbol, state)
+        self.sanitize_state_for_source_policy(symbol, state)
         self.state_by_symbol[symbol] = state
         return state
 
@@ -251,6 +259,10 @@ class OctopusComputeV2:
             turnover_threshold=self.big_trade_turnover_threshold,
         )
 
+    def sanitize_state_for_source_policy(self, symbol: str, state: dict[str, Any]) -> None:
+        self.filter_state_alerts_for_policy(symbol, state)
+        sanitize_broker_queue_snapshot(state)
+
     def filter_state_alerts_for_policy(self, symbol: str, state: dict[str, Any]) -> None:
         alerts = state.get("alerts")
         if not isinstance(alerts, list):
@@ -259,6 +271,8 @@ class OctopusComputeV2:
         filtered: list[dict[str, Any]] = []
         for alert in alerts:
             if not isinstance(alert, dict):
+                continue
+            if not is_canonical_big_trade_alert(alert):
                 continue
             tick = {
                 "price": float(alert.get("price") or 0),
@@ -389,20 +403,31 @@ class OctopusComputeV2:
             if not self.is_big_trade(tick, bod):
                 continue
             payload = {
+                "source_kind": "canonical_trade_tick",
+                "source_table": "trade_ticks",
+                "source_event_id": str(row.get("row_hash") or row.get("trade_id") or ""),
+                "price": tick["price"],
+                "volume": tick["volume"],
+                "turnover": tick["turnover"],
                 "side": row.get("side"),
                 "broker_code": row.get("broker_code"),
                 "broker_name": row.get("broker_name"),
                 "participant_id": row.get("participant_id"),
                 "participant_name": row.get("participant_name"),
                 "trade_type": row.get("trade_type"),
+                "trade_id": row.get("trade_id"),
+                "row_hash": row.get("row_hash"),
             }
             raw_event = {
                 "event_id": (
                     f"historical-alert-{symbol}-{safe_alert_id_part(tick_ts)}-"
                     f"{safe_alert_id_part(str(row.get('trade_id') or row.get('row_hash') or index))}"
                 ),
+                "kind": "tick",
                 "payload": payload,
             }
+            if not is_trade_tick_alert_source(raw_event):
+                continue
             alerts.append(make_big_trade_alert(raw_event, tick, bod))
         alerts.sort(key=lambda alert: str(alert.get("timestamp") or ""), reverse=True)
         return alerts[:500], latest_tick_ts
@@ -525,17 +550,35 @@ class OctopusComputeV2:
         if is_trade_tick_alert_source(raw_event):
             return self.process_trade_tick_alert_event(raw_event, trade_date, state)
 
-        processed_events: list[dict[str, Any]] = []
-        self.seq_by_symbol[symbol] += 1
-        update = self.apply_tick_to_state(state, raw_event, trade_date)
-        tick = update.tick
-        alert = update.alert
-        snapshot_seq = self.seq_by_symbol[symbol]
-        alert_seq: int | None = None
+        return self.process_realtime_tick_event(raw_event, trade_date, state)
 
-        if alert is not None:
-            self.seq_by_symbol[symbol] += 1
-            alert_seq = self.seq_by_symbol[symbol]
+    def process_realtime_tick_event(
+        self,
+        raw_event: dict[str, Any],
+        trade_date: str,
+        state: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """Apply a non-canonical realtime price tick without alert side effects."""
+        symbol = raw_event["symbol"]
+        self.seq_by_symbol[symbol] += 1
+        period = str(raw_event.get("period") or "").strip().lower()
+        ordinary_transaction = period in {"hktransaction", "tick", "trade_tick"}
+        update = self.apply_tick_to_state(
+            state,
+            raw_event,
+            trade_date,
+            minute_freshness_key="latest_bar" if ordinary_transaction else "minute_bars",
+            updates_chart=not ordinary_transaction,
+            updates_snapshot_totals=not ordinary_transaction,
+            chart_update=not ordinary_transaction,
+            updates_alerts=False,
+        )
+        tick = update.tick
+        snapshot_seq = self.seq_by_symbol[symbol]
+        if ordinary_transaction and not self.should_publish_latest_bar(symbol, tick):
+            self.health.latest_event_at_by_symbol[symbol] = raw_event["source_ts"]
+            self.health.kafka_lag = self.bus.lag(RAW_TOPIC, committed_offset=self.seq_by_symbol[symbol])
+            return []
 
         self._cache_set_terminal_snapshot(trade_date, symbol, state)
 
@@ -548,23 +591,9 @@ class OctopusComputeV2:
             payload=state,
         )
         self.bus.publish(PROCESSED_TOPIC, symbol, snapshot_event)
-        processed_events.append(snapshot_event)
-
-        if alert is not None and alert_seq is not None:
-            alert_event = make_processed_market_event(
-                result_type="big_trade_alert",
-                symbol=symbol,
-                source="octopus",
-                seq=alert_seq,
-                source_ts=raw_event["source_ts"],
-                payload={"alert": alert, "freshness": state["freshness"]},
-            )
-            self.bus.publish(PROCESSED_TOPIC, symbol, alert_event)
-            processed_events.append(alert_event)
-
         self.health.latest_event_at_by_symbol[symbol] = raw_event["source_ts"]
         self.health.kafka_lag = self.bus.lag(RAW_TOPIC, committed_offset=self.seq_by_symbol[symbol])
-        return processed_events
+        return [snapshot_event]
 
     def apply_tick_to_state(
         self,
@@ -573,6 +602,10 @@ class OctopusComputeV2:
         trade_date: str,
         *,
         minute_freshness_key: str = "minute_bars",
+        updates_chart: bool = True,
+        updates_snapshot_totals: bool = True,
+        chart_update: bool = True,
+        updates_alerts: bool = True,
     ) -> TickStateUpdate:
         symbol = raw_event["symbol"]
         payload = raw_event["payload"]
@@ -583,6 +616,7 @@ class OctopusComputeV2:
             "volume": int(payload["volume"]),
             "turnover": float(payload["turnover"]),
             "direction": "flat",
+            "chart_update": chart_update,
         }
         is_full_tick_seed = is_full_tick_seed_event(raw_event)
         rollover = snapshot_trade_date(state) != trade_date
@@ -614,30 +648,46 @@ class OctopusComputeV2:
             "price": tick["price"],
             "high": max(float(state["snapshot"].get("high") or tick["price"]), tick["price"]),
             "low": min(float(state["snapshot"].get("low") or tick["price"]), tick["price"]),
-            "volume": tick["volume"] if is_full_tick_seed else int(state["snapshot"]["volume"]) + tick["volume"],
-            "turnover": tick["turnover"] if is_full_tick_seed else float(state["snapshot"]["turnover"]) + tick["turnover"],
+            "volume": (
+                tick["volume"]
+                if is_full_tick_seed
+                else (
+                    int(state["snapshot"]["volume"]) + tick["volume"]
+                    if updates_snapshot_totals
+                    else int(state["snapshot"].get("volume") or 0)
+                )
+            ),
+            "turnover": (
+                tick["turnover"]
+                if is_full_tick_seed
+                else (
+                    float(state["snapshot"]["turnover"]) + tick["turnover"]
+                    if updates_snapshot_totals
+                    else float(state["snapshot"].get("turnover") or 0.0)
+                )
+            ),
             "change": tick["price"] - float(state["snapshot"]["previousClose"]),
             "updatedAt": raw_event["ingest_ts"],
         }
         previous_close = float(state["snapshot"]["previousClose"])
         state["snapshot"]["changePercent"] = 0.0 if previous_close == 0 else state["snapshot"]["change"] / previous_close * 100
-        updates_chart = (not is_full_tick_seed) and is_regular_hk_trading_minute(tick["timestamp"], trade_date)
-        if updates_chart:
+        writes_minute_bar = updates_chart and (not is_full_tick_seed) and is_regular_hk_trading_minute(tick["timestamp"], trade_date)
+        if writes_minute_bar:
             state["minute_bars"] = upsert_minute_bar(state["minute_bars"], tick, trade_date)
         state["last_tick"] = tick
         state["freshness"] = realtime_freshness(
             state,
             raw_event,
             trade_date,
-            updates_minute_bars=updates_chart and minute_freshness_key == "minute_bars",
-            updates_latest_bar=updates_chart and minute_freshness_key == "latest_bar",
+            updates_minute_bars=writes_minute_bar and minute_freshness_key == "minute_bars",
+            updates_latest_bar=minute_freshness_key == "latest_bar",
         )
 
         alert = None
         bod = self.bod_by_symbol.get(symbol)
-        if not is_full_tick_seed and self.is_big_trade(tick, bod):
+        if updates_alerts and is_trade_tick_alert_source(raw_event) and not is_full_tick_seed and self.is_big_trade(tick, bod):
             alert = make_big_trade_alert(raw_event, tick, bod)
-            state["alerts"] = [alert, *state["alerts"]][:500]
+            state["alerts"] = prepend_unique_alert(alert, state.get("alerts", []))
         return TickStateUpdate(state=state, tick=tick, alert=alert)
 
     def process_minute_bar_event(
@@ -779,7 +829,7 @@ class OctopusComputeV2:
 
         self.seq_by_symbol[symbol] += 1
         alert = make_big_trade_alert(raw_event, tick, bod)
-        state["alerts"] = [alert, *state["alerts"]][:500]
+        state["alerts"] = prepend_unique_alert(alert, state.get("alerts", []))
         freshness = dict(state.get("freshness") or {})
         source_dates = dict(freshness.get("source_dates") or {})
         source_dates["trade_ticks"] = trade_date
@@ -810,9 +860,22 @@ class OctopusComputeV2:
         trade_date: str,
         state: dict[str, Any],
     ) -> list[dict[str, Any]]:
-        """Aggregate hktransaction into the forming minute and persist only useful deltas."""
+        """Apply hktransaction as trade metadata/alerts without mutating chart bars.
+
+        xt hktransaction volume is not authoritative for chart aggregation in this
+        runtime. Native 1m bars are the only writer for minute_bars and cumulative
+        snapshot volume/turnover after startup/full_tick seeding.
+        """
         symbol = raw_event["symbol"]
-        update = self.apply_tick_to_state(state, raw_event, trade_date, minute_freshness_key="latest_bar")
+        update = self.apply_tick_to_state(
+            state,
+            raw_event,
+            trade_date,
+            minute_freshness_key="latest_bar",
+            updates_chart=False,
+            updates_snapshot_totals=False,
+            chart_update=False,
+        )
         tick = update.tick
         alert = update.alert
         publish_snapshot = self.should_publish_latest_bar(symbol, tick)
@@ -872,8 +935,13 @@ class OctopusComputeV2:
     ) -> list[dict[str, Any]]:
         symbol = raw_event["symbol"]
         update = self.apply_broker_queue_to_state(state, raw_event, trade_date)
+        if not update.applied:
+            return []
         self.seq_by_symbol[symbol] += 1
         self._cache_set_terminal_snapshot(trade_date, symbol, state)
+        delta = broker_queue_delta_for_event(update.broker_queue, raw_event["payload"].get("side"))
+        if not delta:
+            return []
         event = make_processed_market_event(
             result_type="broker_queue",
             symbol=symbol,
@@ -882,7 +950,7 @@ class OctopusComputeV2:
             source_ts=raw_event["source_ts"],
             payload={
                 "side": raw_event["payload"].get("side"),
-                "broker_queue": update.broker_queue,
+                "broker_queue": delta,
                 "freshness": state["freshness"],
             },
         )
@@ -898,7 +966,9 @@ class OctopusComputeV2:
         state: dict[str, Any],
     ) -> list[dict[str, Any]]:
         symbol = raw_event["symbol"]
-        self.apply_l2_order_book_to_state(state, raw_event, trade_date)
+        update = self.apply_l2_order_book_to_state(state, raw_event, trade_date)
+        if not update.applied:
+            return []
         self.seq_by_symbol[symbol] += 1
         self._cache_set_terminal_snapshot(trade_date, symbol, state)
         event = make_processed_market_event(
@@ -922,7 +992,11 @@ class OctopusComputeV2:
     ) -> BrokerQueueStateUpdate:
         rollover_realtime_session(state, trade_date, raw_event["ingest_ts"])
         broker_queue = normalize_raw_broker_queue(raw_event["payload"], self.bod_by_symbol.get(raw_event["symbol"]))
-        state["broker_queue"] = merge_broker_queue(state["broker_queue"], broker_queue)
+        if not queue_has_entries(broker_queue):
+            return BrokerQueueStateUpdate(state=state, broker_queue={"ask": [], "bid": []}, applied=False)
+        merged = merge_broker_queue(state["broker_queue"], broker_queue)
+        state["broker_queue"] = enrich_broker_queue_with_depth(merged, state.get("l2_order_book"))
+        broker_queue = enrich_broker_queue_with_depth(broker_queue, state.get("l2_order_book"))
         state["freshness"] = realtime_freshness(state, raw_event, trade_date)
         return BrokerQueueStateUpdate(state=state, broker_queue=broker_queue)
 
@@ -934,15 +1008,20 @@ class OctopusComputeV2:
     ) -> L2OrderBookStateUpdate:
         rollover_realtime_session(state, trade_date, raw_event["ingest_ts"])
         order_book = normalize_l2_order_book(raw_event["payload"])
+        if not order_book_has_valid_depth(order_book):
+            existing = state.get("l2_order_book") if isinstance(state.get("l2_order_book"), dict) else empty_l2_order_book()
+            return L2OrderBookStateUpdate(state=state, order_book=existing, applied=False)
         state["l2_order_book"] = order_book
+        state["broker_queue"] = enrich_broker_queue_with_depth(state.get("broker_queue"), order_book)
         state["freshness"] = realtime_freshness(state, raw_event, trade_date)
         return L2OrderBookStateUpdate(state=state, order_book=order_book)
 
 
 class GatewayV2:
-    def __init__(self, bus: EventBus, cache: SnapshotCache) -> None:
+    def __init__(self, bus: EventBus, cache: SnapshotCache, *, runtime_epoch: str = "") -> None:
         self.bus = bus
         self.cache = cache
+        self.runtime_epoch = runtime_epoch or now_iso()
         self.seq_by_symbol: dict[str, int] = defaultdict(int)
         self.processed_records_consumed = 0
         self.shadow_processed_records_drained = 0
@@ -1054,6 +1133,7 @@ class GatewayV2:
             source_ts=source_ts,
             payload=payload,
         )
+        message["runtime_epoch"] = self.runtime_epoch
         validate_terminal_message(message)
         self.health.latest_event_at_by_symbol[symbol] = message["source_ts"]
         return message
@@ -1159,11 +1239,11 @@ def to_broker_queue(rows: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]
         side_rows.sort(key=lambda row: (int(row.get("position") or 0), str(row.get("queue_ts") or "")))
         for index, row in enumerate(side_rows, start=1):
             price = float(row.get("price") or 0)
-            volume = int(row.get("volume") or 0)
+            volume = nullable_positive_int(row.get("volume"))
             broker_code = str(row.get("broker_code") or "")
             queue[side].append(
                 {
-                    "id": f"{row['symbol']}-{side}-{index}-{broker_code}-{price}-{volume}",
+                    "id": f"{row['symbol']}-{side}-{index}-{broker_code}-{price}-{volume if volume is not None else 'unknown'}",
                     "position": index,
                     "side": side,
                     "participantName": normalized_participant_display(
@@ -1174,6 +1254,7 @@ def to_broker_queue(rows: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]
                     "brokerCode": row["broker_code"],
                     "price": price,
                     "volume": volume,
+                    "volume_unknown": volume is None,
                 }
             )
     return queue
@@ -1206,11 +1287,26 @@ def is_minute_bar_source(raw_event: dict[str, Any]) -> bool:
 
 
 def is_trade_tick_alert_source(raw_event: dict[str, Any]) -> bool:
-    period = str(raw_event.get("period") or "").strip().lower()
-    source = str(raw_event.get("source") or "").strip().lower()
-    if period in {"hktransaction", "trade_tick", "tick"}:
-        return True
-    return source in {"mammoth", "mammoth-real-data-runner"}
+    if raw_event.get("kind") != "tick":
+        return False
+    payload = raw_event.get("payload")
+    if not isinstance(payload, dict):
+        return False
+    if str(payload.get("source_kind") or "").strip() != "canonical_trade_tick":
+        return False
+    if not str(payload.get("source_table") or "").strip():
+        return False
+    if not canonical_trade_tick_payload_provenance(payload):
+        return False
+    if normalize_trade_side(payload.get("side")) == "neutral":
+        return False
+    volume = nullable_positive_int(payload.get("volume"))
+    if volume is None:
+        return False
+    try:
+        return float(payload.get("turnover") or 0) > 0 and float(payload.get("price") or 0) > 0
+    except (TypeError, ValueError):
+        return False
 
 
 def make_big_trade_alert(raw_event: dict[str, Any], tick: dict[str, Any], bod: BodState | None = None) -> dict[str, Any]:
@@ -1229,6 +1325,7 @@ def make_big_trade_alert(raw_event: dict[str, Any], tick: dict[str, Any], bod: B
     highlighted = bool(payload.get("is_highlighted", False))
     if bod:
         highlighted = highlighted or participant_id in bod.highlighted_participants or participant_name in bod.highlighted_participants
+    provenance = canonical_trade_tick_provenance(payload, raw_event)
     return {
         "id": f"alert-{raw_event['event_id']}",
         "timestamp": tick["timestamp"],
@@ -1240,7 +1337,69 @@ def make_big_trade_alert(raw_event: dict[str, Any], tick: dict[str, Any], bod: B
         "brokerName": broker_name,
         "brokerCode": broker_code,
         "isHighlighted": highlighted,
+        "source_kind": "canonical_trade_tick",
+        "source_table": str(payload.get("source_table") or "trade_ticks"),
+        "source_event_id": provenance,
+        "trade_id": str(payload.get("trade_id") or ""),
+        "row_hash": str(payload.get("row_hash") or ""),
     }
+
+
+def canonical_trade_tick_provenance(payload: dict[str, Any], raw_event: dict[str, Any]) -> str:
+    payload_provenance = canonical_trade_tick_payload_provenance(payload)
+    if payload_provenance:
+        return payload_provenance
+    return str(raw_event.get("event_id") or "").strip()
+
+
+def canonical_trade_tick_payload_provenance(payload: dict[str, Any]) -> str:
+    for key in ("trade_id", "row_hash", "source_event_id"):
+        value = str(payload.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def prepend_unique_alert(alert: dict[str, Any], existing_alerts: Any) -> list[dict[str, Any]]:
+    alerts = [item for item in existing_alerts if isinstance(item, dict)] if isinstance(existing_alerts, list) else []
+    alert_id = str(alert.get("id") or "")
+    if alert_id:
+        alerts = [item for item in alerts if str(item.get("id") or "") != alert_id]
+    elif alert in alerts:
+        alerts = [item for item in alerts if item != alert]
+    return [alert, *alerts][:500]
+
+
+def is_canonical_big_trade_alert(alert: dict[str, Any]) -> bool:
+    if str(alert.get("source_kind") or "") != "canonical_trade_tick":
+        return False
+    if not any(str(alert.get(key) or "").strip() for key in ("trade_id", "row_hash", "source_event_id")):
+        return False
+    return normalize_trade_side(alert.get("side")) != "neutral"
+
+
+def sanitize_broker_queue_snapshot(state: dict[str, Any]) -> None:
+    broker_queue = state.get("broker_queue")
+    if not isinstance(broker_queue, dict):
+        return
+    for side in ("ask", "bid"):
+        entries = broker_queue.get(side)
+        if not isinstance(entries, list):
+            continue
+        sanitized = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            current = dict(entry)
+            volume = nullable_positive_int(current.get("volume"))
+            current["volume"] = volume
+            current["volume_unknown"] = volume is None
+            if "levelVolume" in current or "level_volume" in current:
+                level_volume = nullable_positive_int(current.get("levelVolume", current.get("level_volume")))
+                current["levelVolume"] = level_volume
+                current["depthAvailable"] = level_volume is not None and bool(current.get("depthAvailable", True))
+            sanitized.append(current)
+        broker_queue[side] = sanitized
 
 
 def normalized_participant_display(participant_name: Any, broker_code: str, payload: dict[str, Any]) -> str:
@@ -1476,6 +1635,7 @@ def normalize_raw_broker_queue(payload: dict[str, Any], bod: BodState | None = N
         if item_side not in queue:
             continue
         broker_code = str(item.get("brokerCode") or item.get("broker_code") or "")
+        volume = nullable_positive_int(first_present_dict(item, "volume", "qty", "quantity"))
         mapping = bod.broker_mapping_by_code.get(broker_code, {}) if bod and broker_code else {}
         participant_name = (
             item.get("participantName")
@@ -1491,7 +1651,8 @@ def normalize_raw_broker_queue(payload: dict[str, Any], bod: BodState | None = N
                 "participantName": normalized_participant_display(participant_name, broker_code, item),
                 "brokerCode": broker_code,
                 "price": float(item.get("price") or 0),
-                "volume": int(item.get("volume") or item.get("qty") or item.get("quantity") or 0),
+                "volume": volume,
+                "volume_unknown": volume is None,
             }
         )
     queue["ask"].sort(key=lambda row: row["position"])
@@ -1507,6 +1668,116 @@ def merge_broker_queue(
         "ask": update["ask"] if update["ask"] else current.get("ask", []),
         "bid": update["bid"] if update["bid"] else current.get("bid", []),
     }
+
+
+def queue_has_entries(queue: dict[str, list[dict[str, Any]]]) -> bool:
+    return any(bool(queue.get(side)) for side in ("ask", "bid"))
+
+
+def broker_queue_delta_for_event(queue: dict[str, list[dict[str, Any]]], side: Any = None) -> dict[str, list[dict[str, Any]]]:
+    normalized_side = str(side or "").strip().lower()
+    if normalized_side in {"ask", "bid"}:
+        entries = queue.get(normalized_side) or []
+        return {normalized_side: entries} if entries else {}
+    return {side_key: entries for side_key in ("ask", "bid") if (entries := queue.get(side_key) or [])}
+
+
+def enrich_broker_queue_with_depth(current: Any, order_book: Any) -> dict[str, list[dict[str, Any]]]:
+    queue = current if isinstance(current, dict) else {"ask": [], "bid": []}
+    book = order_book if isinstance(order_book, dict) else {}
+    enriched: dict[str, list[dict[str, Any]]] = {"ask": [], "bid": []}
+    for side in ("ask", "bid"):
+        raw_entries = queue.get(side) if isinstance(queue.get(side), list) else []
+        entries = [dict(entry) for entry in raw_entries if isinstance(entry, dict)]
+        levels = [level for level in book.get(side, []) if isinstance(level, dict)]
+        level_by_price = {price_key(level.get("price")): level for level in levels if price_key(level.get("price"))}
+        broker_count_by_price: dict[str, int] = defaultdict(int)
+        for entry in entries:
+            key = price_key(entry.get("price"))
+            if key:
+                broker_count_by_price[key] += 1
+        used_prices: set[str] = set()
+        for entry in entries:
+            key = price_key(entry.get("price"))
+            level = level_by_price.get(key)
+            if level is not None:
+                used_prices.add(key)
+                entry["levelVolume"] = int(level.get("volume") or 0)
+                entry["depthPosition"] = int(level.get("position") or entry.get("position") or 0)
+                entry["depthAvailable"] = True
+                entry["brokerCountAtPrice"] = broker_count_by_price.get(key, 0)
+            else:
+                entry.setdefault("levelVolume", None)
+                entry.setdefault("depthAvailable", False)
+            enriched[side].append(entry)
+        for level in levels:
+            key = price_key(level.get("price"))
+            if not key or key in used_prices:
+                continue
+            position = int(level.get("position") or len(enriched[side]) + 1)
+            volume = int(level.get("volume") or 0)
+            enriched[side].append(
+                {
+                    "id": f"depth-{side}-{position}-{key}",
+                    "position": position,
+                    "side": side,
+                    "participantName": "档位总量",
+                    "brokerCode": "",
+                    "price": float(level.get("price") or 0),
+                    "volume": None,
+                    "volume_unknown": True,
+                    "levelVolume": volume,
+                    "depthPosition": position,
+                    "depthAvailable": True,
+                    "brokerCountAtPrice": broker_count_by_price.get(key, 0),
+                    "isDepthLevel": True,
+                }
+            )
+        enriched[side].sort(key=lambda row: (int(row.get("depthPosition") or row.get("position") or 0), int(row.get("position") or 0), str(row.get("id") or "")))
+    return enriched
+
+
+def price_key(value: Any) -> str:
+    try:
+        price = float(value)
+    except (TypeError, ValueError):
+        return ""
+    return f"{price:.6f}"
+
+
+def nullable_positive_int(value: Any) -> int | None:
+    if value in (None, ""):
+        return None
+    try:
+        parsed = int(float(value))
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def first_present_dict(data: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        if key in data and data[key] is not None:
+            return data[key]
+    return None
+
+
+def order_book_has_valid_depth(order_book: dict[str, Any]) -> bool:
+    for side in ("ask", "bid"):
+        levels = order_book.get(side)
+        if not isinstance(levels, list):
+            continue
+        for level in levels:
+            if not isinstance(level, dict):
+                continue
+            try:
+                price = float(level.get("price") or 0)
+                volume = int(level.get("volume") or 0)
+            except (TypeError, ValueError):
+                continue
+            if price > 0 and volume > 0:
+                return True
+    return False
 
 
 def realtime_freshness(
@@ -1526,13 +1797,17 @@ def realtime_freshness(
             source_dates["latest_bar"] = trade_date
         if is_full_tick_seed_event(raw_event):
             source_dates["full_tick"] = trade_date
+        if is_trade_tick_alert_source(raw_event):
+            source_dates["trade_ticks"] = trade_date
         source_dates["realtime"] = trade_date
     elif raw_event.get("kind") == "broker_queue":
         source_dates["broker_queue"] = trade_date
         source_dates["realtime"] = trade_date
+        existing["broker_queue_last_valid_ts"] = raw_event["source_ts"]
     elif raw_event.get("kind") == "l2_order_book":
         source_dates["l2_order_book"] = trade_date
         source_dates["realtime"] = trade_date
+        existing["depth_last_valid_ts"] = raw_event["source_ts"]
     degraded_reasons = freshness_degraded_reasons(state, source_dates, trade_date)
     return {
         **existing,
@@ -1624,6 +1899,10 @@ def normalize_l2_order_book(payload: dict[str, Any]) -> dict[str, Any]:
     bid = normalize_l2_levels(payload.get("bid") or payload.get("bids") or [], "bid")
     ask.sort(key=lambda level: level["price"])
     bid.sort(key=lambda level: level["price"], reverse=True)
+    for index, level in enumerate(ask, start=1):
+        level["position"] = index
+    for index, level in enumerate(bid, start=1):
+        level["position"] = index
     best_ask = ask[0]["price"] if ask else None
     best_bid = bid[0]["price"] if bid else None
     spread = None if best_ask is None or best_bid is None else best_ask - best_bid
@@ -1643,12 +1922,22 @@ def normalize_l2_levels(levels: Any, side: str) -> list[dict[str, Any]]:
     for index, level in enumerate(levels):
         if not isinstance(level, dict):
             continue
+        try:
+            price = float(level.get("price") or 0)
+        except (TypeError, ValueError):
+            continue
+        if price <= 0:
+            continue
+        try:
+            volume = int(level.get("volume") or level.get("qty") or level.get("quantity") or 0)
+        except (TypeError, ValueError):
+            volume = 0
         normalized.append(
             {
                 "position": int(level.get("position") or level.get("rank") or index + 1),
                 "side": side,
-                "price": float(level.get("price") or 0),
-                "volume": int(level.get("volume") or level.get("qty") or level.get("quantity") or 0),
+                "price": price,
+                "volume": max(0, volume),
                 "order_count": int(level.get("order_count") or level.get("orders") or 0),
             }
         )

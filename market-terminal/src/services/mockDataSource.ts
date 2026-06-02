@@ -408,12 +408,13 @@ export class MockDataSource implements MarketDataSource {
 
   private createAlert(runtime: MockRuntime): BigTradeAlert {
     const participant = pick(runtime.rng, PARTICIPANTS)
-    const side: TradeSide = runtime.rng() > 0.52 ? 'buy' : runtime.rng() > 0.18 ? 'sell' : 'neutral'
+    const side: TradeSide = runtime.rng() > 0.5 ? 'buy' : 'sell'
     const volume = roundLot(250_000 + runtime.rng() * 2_800_000, runtime.profile.lotSize)
     const price = roundPrice(runtime.price + (runtime.rng() - 0.5) * runtime.profile.basePrice * 0.004)
+    const sourceEventId = `${runtime.symbol}-mock-trade-${runtime.sequence}-${Math.floor(runtime.rng() * 1_000_000)}`
 
     return {
-      id: `${runtime.symbol}-alert-${runtime.sequence}-${Math.floor(runtime.rng() * 1_000_000)}`,
+      id: `${runtime.symbol}-alert-${sourceEventId}`,
       timestamp: new Date(Date.now() - runtime.rng() * 3_600_000).toISOString(),
       price,
       volume,
@@ -421,7 +422,11 @@ export class MockDataSource implements MarketDataSource {
       side,
       participantName: participant.name,
       brokerName: participant.name,
-      remark: side === 'neutral' ? 'Cross' : side === 'buy' ? 'Aggressive buy' : 'Aggressive sell',
+      sourceKind: 'canonical_trade_tick',
+      sourceTable: 'trade_ticks',
+      sourceEventId,
+      tradeId: sourceEventId,
+      remark: side === 'buy' ? 'Aggressive buy' : 'Aggressive sell',
       isHighlighted: participant.highlighted,
     }
   }

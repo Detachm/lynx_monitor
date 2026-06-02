@@ -38,6 +38,7 @@ let performanceSamples: MarketPerformanceSample[] = []
 
 export function createEmptySymbolState(): SymbolState {
   return {
+    runtimeEpoch: null,
     snapshot: null,
     ticks: [],
     alerts: [],
@@ -282,6 +283,16 @@ export const useMarketStore = defineStore('market', {
       try {
         const state = this.ensureSymbol(message.symbol)
         state.lastUpdatedAt = new Date().toISOString()
+        if (message.runtimeEpoch) {
+          if (state.runtimeEpoch && state.runtimeEpoch !== message.runtimeEpoch) {
+            resetSymbolForRuntimeEpoch(state, message.runtimeEpoch)
+            if (message.type !== 'snapshot') {
+              return
+            }
+          } else {
+            state.runtimeEpoch = message.runtimeEpoch
+          }
+        }
         this.health = {
           ...this.health,
           latestEventAtBySymbol: {
@@ -291,6 +302,7 @@ export const useMarketStore = defineStore('market', {
           updatedAt: state.lastUpdatedAt,
         }
 
+        const snapshotVolumeBeforeMessage = state.snapshot?.volume ?? 0
         switch (message.type) {
           case 'snapshot':
             state.snapshot = message.snapshot
@@ -307,7 +319,13 @@ export const useMarketStore = defineStore('market', {
             if (message.snapshot) {
               state.snapshot = message.snapshot
             }
-            if (isRegularSessionTick(message.tick, tradeDateForMessage(message.snapshot ?? state.snapshot, message.freshness ?? state.freshness ?? undefined))) {
+            if (
+              shouldApplyChartTick(message.tick, snapshotVolumeBeforeMessage, message.symbol) &&
+              isRegularSessionTick(
+                message.tick,
+                tradeDateForMessage(message.snapshot ?? state.snapshot, message.freshness ?? state.freshness ?? undefined),
+              )
+            ) {
               state.ticks = upsertMinuteTick(state.ticks, message.tick)
             }
             if (message.freshness) {
@@ -432,6 +450,20 @@ function recordStoreUpdatePerformanceSample(startedAt: number, message: MarketMe
   })
 }
 
+function resetSymbolForRuntimeEpoch(state: SymbolState, runtimeEpoch: string) {
+  state.runtimeEpoch = runtimeEpoch
+  state.snapshot = null
+  state.ticks = []
+  state.alerts = []
+  state.askQueues = []
+  state.bidQueues = []
+  state.freshness = null
+  state.snapshotLoaded = false
+  state.subscriptionStatus = 'loading'
+  state.subscriptionError = null
+  state.unreadAlerts = 0
+}
+
 function recordPerformanceSample(sample: MarketPerformanceSample) {
   performanceSamples = [...performanceSamples, sample].slice(-MAX_PERFORMANCE_SAMPLES)
   performanceSampleHandler?.(sample)
@@ -500,6 +532,23 @@ function upsertMinuteTick(existing: PriceTick[], tick: PriceTick): PriceTick[] {
   return updated
     .sort((left, right) => minuteBucket(left.timestamp).localeCompare(minuteBucket(right.timestamp)))
     .slice(-MAX_TICKS_PER_SYMBOL)
+}
+
+function shouldApplyChartTick(tick: PriceTick, snapshotVolume: number, symbol: StockSymbol): boolean {
+  if (tick.chartUpdate === false) {
+    return false
+  }
+  if (!tick.replace && snapshotVolume > 0 && tick.volume > snapshotVolume) {
+    recordPerformanceSample({
+      key: 'realtime_tick_volume_anomaly',
+      valueMs: 0,
+      symbol,
+      messageType: 'tick_realtime',
+      recordedAt: new Date().toISOString(),
+    })
+    return false
+  }
+  return true
 }
 
 function canonicalizeMinuteTicks(ticks: PriceTick[], tradeDate?: string): PriceTick[] {

@@ -4,6 +4,8 @@ Status: authoritative target architecture as of 2026-05-26.
 
 This document is the development source of truth for the market terminal runtime. No older roadmap or target-architecture Markdown should be used as development input. If a future document conflicts with this file, either update it to reference this architecture or remove it from the active documentation set.
 
+The data-source remediation rules in `terminal-data-source-remediation-plan.md` are part of this architecture and govern the minute-bar, big-trade, broker-queue, and depth boundaries.
+
 ## 1. Product Target
 
 The terminal must serve multiple traders on the LAN. Each trader can open a different watchlist and query symbols that were not preconfigured before process start.
@@ -28,8 +30,8 @@ The first production scope remains an intraday monitoring terminal. It is not a 
 4. Kafka stores durable market facts, not every UI frame by default.
 5. Mammoth silver is the historical fact source.
 6. xtquant realtime callbacks must be enqueue-only and non-blocking.
-7. Minute bars for charts come from native 1m historical bars plus realtime deltas, not from full tick replay as the normal path.
-8. Tick replay is a recovery fallback for alert reconstruction, not the main charting path.
+7. Minute bars for charts come from Redis/native `1m` bars plus the latest forming state only; ordinary `hktransaction` ticks must not rewrite confirmed historical minute bars.
+8. Big-trade alerts come only from canonical trade ticks with provenance; ordinary ticks and ambiguous `hktransaction` snapshots must not create alerts.
 9. One cold symbol request must trigger at most one upstream hydration job.
 10. Every boundary must expose freshness, lag, and degraded reasons.
 
@@ -118,25 +120,37 @@ Hydration must be per symbol and per data type, with singleflight protection:
 - `ccass_holdings`: current latest available date `<= trade_date` and previous effective CCASS date.
 - `broker_mapping`: global shared mapping, loaded once and versioned.
 - `broker_queue`: latest available queue snapshot when realtime is unavailable.
-- `trade_ticks`: optional fallback for alert reconstruction and audit only.
+- `trade_ticks`: canonical single-print source for alert reconstruction and audit. Ordinary `hktransaction` can be an upstream input only after normalization to canonical trade ticks.
 
 For closed-market days, effective trade date is the latest market trading day with available data. Payloads must include requested date, effective date, and source dates so the frontend can show evidence instead of pretending data is realtime.
 
-## 7. Minute Bars and Big Trades
+## 7. Minute Bars, Big Trades, And Queues
 
 Minute K chart source of truth:
 
 1. Use xtquant/Mammoth native 1m bars to initialize the day.
-2. During live market, merge realtime tick deltas into the current minute only.
-3. On restart, reload 1m bars and only replay the missing short tick window if needed.
+2. During live market, ordinary `hktransaction` ticks update latest price/forming state only and are flushed to UI with per-symbol coalescing.
+3. Confirmed native `1m` bars replace the same-minute forming state and update the confirmed chart.
+4. Ordinary ticks never rewrite confirmed historical K lines and never create big-trade alerts.
+5. On restart, reload Redis/native `1m` bars first and only replay canonical trade ticks for alert continuity.
 
 Big trade definition:
 
 - A big trade is based on volume relative to the previous effective trading day's total volume.
 - Default rule: `single_trade_volume >= previous_day_total_volume * ratio`.
 - The ratio is runtime config, not a hardcoded turnover threshold.
+- The input must be a canonical trade tick with `source_kind="canonical_trade_tick"`, a `source_table`/source marker, non-neutral `side`, and at least one provenance field: `trade_id`, `row_hash`, or `source_event_id`.
+- Ordinary `hktransaction` ticks, neutral prints without reliable side provenance, ambiguous cumulative volumes, and cached alerts without canonical provenance must not enter the alert read model.
 - Participant display for both big-trade alerts and broker queue rows must be one of: actual participant, `集合竞价`, `未披露`.
 - Broker queue rows must never surface placeholder values such as blank strings, `--`, or synthetic `Broker ...` names in the participant column; unmapped or undisclosed rows display `未披露`.
+
+Broker queue and depth rules:
+
+- Broker-level `volume` is nullable. Missing, empty, zero, or SDK placeholder-zero values mean unknown and display as `--`.
+- Broker-level volume and price-level order-book depth are separate fields. Do not copy, average, or distribute price-level volume into broker entries.
+- Queue display defaults to 10 levels. 100/1000 controls are enabled only when real depth at those levels has arrived.
+- Empty broker queues, all-zero depth callbacks, and invalid depth updates must not overwrite the last valid queue/depth state.
+- Freshness/health must expose `trade_tick_source_available`, `trade_tick_replay_count`, `alert_count_by_symbol`, `broker_queue_last_valid_ts`, and `depth_last_valid_ts`.
 
 ## 8. Kafka Boundaries
 

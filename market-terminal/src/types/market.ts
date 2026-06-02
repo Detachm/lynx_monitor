@@ -71,6 +71,7 @@ export interface FreshnessPayload {
   requestedTradeDate?: string
   effectiveTradeDate?: string
   runtimeState?: 'COLD' | 'HYDRATING' | 'WARM' | 'LIVE' | 'DEGRADED' | 'EVICTING' | string
+  runtimeEpoch?: string
   sourceDates: Record<string, string>
 }
 
@@ -100,6 +101,7 @@ export interface PriceTick {
   turnover: number
   direction: 'up' | 'down' | 'flat'
   replace?: boolean
+  chartUpdate?: boolean
 }
 
 export interface BigTradeAlert {
@@ -112,6 +114,11 @@ export interface BigTradeAlert {
   participantName: string
   brokerName: string
   brokerCode?: string
+  sourceKind?: 'canonical_trade_tick' | string
+  sourceTable?: string
+  sourceEventId?: string
+  tradeId?: string
+  rowHash?: string
   remark?: string
   isHighlighted: boolean
 }
@@ -123,7 +130,13 @@ export interface BrokerQueueEntry {
   participantName: string
   brokerCode: string
   price: number
-  volume: number
+  volume: number | null
+  volumeUnknown?: boolean
+  levelVolume?: number | null
+  depthPosition?: number
+  depthAvailable?: boolean
+  brokerCountAtPrice?: number
+  isDepthLevel?: boolean
 }
 
 export interface HoldingEntry {
@@ -199,6 +212,7 @@ export type TerminalMessage<TType extends TerminalMessageType = TerminalMessageT
 }[TType]
 
 export interface SymbolState {
+  runtimeEpoch?: string | null
   snapshot: MarketSnapshot | null
   ticks: PriceTick[]
   alerts: BigTradeAlert[]
@@ -220,6 +234,8 @@ export interface TerminalHealthStatus {
   redis: 'unknown' | 'connected' | 'degraded' | 'down'
   kafkaLag: number | null
   latestEventAtBySymbol: Record<StockSymbol, string>
+  tradeTickSourceAvailable?: boolean
+  tradeTickSourceAvailableBySymbol: Record<StockSymbol, boolean>
   symbolFreshness: Record<
     StockSymbol,
     {
@@ -238,6 +254,7 @@ export interface TerminalHealthStatus {
 export interface SnapshotMessage {
   type: 'snapshot'
   symbol: StockSymbol
+  runtimeEpoch?: string
   snapshot: MarketSnapshot
   ticks: PriceTick[]
   alerts: BigTradeAlert[]
@@ -250,6 +267,7 @@ export interface SnapshotMessage {
 export interface TickRealtimeMessage {
   type: 'tick_realtime'
   symbol: StockSymbol
+  runtimeEpoch?: string
   tick: PriceTick
   snapshot?: MarketSnapshot
   freshness?: FreshnessPayload
@@ -258,6 +276,7 @@ export interface TickRealtimeMessage {
 export interface AlertRealtimeMessage {
   type: 'alert_realtime'
   symbol: StockSymbol
+  runtimeEpoch?: string
   alert: BigTradeAlert
   freshness?: FreshnessPayload
 }
@@ -265,6 +284,7 @@ export interface AlertRealtimeMessage {
 export interface QueueRealtimeMessage {
   type: 'queue_realtime'
   symbol: StockSymbol
+  runtimeEpoch?: string
   side?: QueueSide
   askQueues?: BrokerQueueEntry[]
   bidQueues?: BrokerQueueEntry[]
@@ -274,6 +294,7 @@ export interface QueueRealtimeMessage {
 export interface HoldingHistoryMessage {
   type: 'holding_name_click_response'
   symbol: StockSymbol
+  runtimeEpoch?: string
   participantName: string
   days: number
   history: HoldingHistoryPoint[]

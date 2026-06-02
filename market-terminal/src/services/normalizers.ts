@@ -145,6 +145,7 @@ function normalizeSnapshotMessage(symbol: string, raw: JsonRecord): SnapshotMess
   return {
     type: 'snapshot',
     symbol,
+    runtimeEpoch: runtimeEpochValue(raw),
     snapshot: normalizeSnapshot(symbol, snapshotRecord, timestampValue(raw.source_ts ?? raw.sourceTs)),
     ticks: compactMap(arrayValue(raw.minute_bars ?? raw.ticks ?? raw.minute_ticks), (item, index) =>
       normalizeTick(recordValue(item) ?? {}, index),
@@ -172,6 +173,7 @@ function normalizeTickMessage(symbol: string, raw: JsonRecord): TickRealtimeMess
   return {
     type: 'tick_realtime',
     symbol,
+    runtimeEpoch: runtimeEpochValue(raw),
     tick,
     snapshot: snapshotRecord ? normalizeSnapshot(symbol, snapshotRecord, fallbackTimestamp) : undefined,
     freshness: recordValue(raw.freshness) ? normalizeFreshness(recordValue(raw.freshness) ?? {}, fallbackTimestamp) : undefined,
@@ -188,6 +190,7 @@ function normalizeAlertMessage(symbol: string, raw: JsonRecord): AlertRealtimeMe
   return {
     type: 'alert_realtime',
     symbol,
+    runtimeEpoch: runtimeEpochValue(raw),
     alert,
     freshness: recordValue(raw.freshness) ? normalizeFreshness(recordValue(raw.freshness) ?? {}, fallbackTimestamp) : undefined,
   }
@@ -199,22 +202,25 @@ function normalizeQueueMessage(symbol: string, raw: JsonRecord): QueueRealtimeMe
   const message: QueueRealtimeMessage = {
     type: 'queue_realtime',
     symbol,
+    runtimeEpoch: runtimeEpochValue(raw),
     side,
     freshness: recordValue(raw.freshness)
       ? normalizeFreshness(recordValue(raw.freshness) ?? {}, timestampValue(raw.source_ts ?? raw.sourceTs))
       : undefined,
   }
 
-  if (raw.askQueues || raw.ask_queues || brokerQueue?.ask || side === 'ask') {
+  const askInput = raw.askQueues ?? raw.ask_queues ?? brokerQueue?.ask ?? (side === 'ask' ? raw.queues : undefined)
+  if (queueInputHasRows(askInput)) {
     message.askQueues = normalizeQueueArray(
-      raw.askQueues ?? raw.ask_queues ?? brokerQueue?.ask ?? raw.queues,
+      askInput,
       'ask',
     )
   }
 
-  if (raw.bidQueues || raw.bid_queues || brokerQueue?.bid || side === 'bid') {
+  const bidInput = raw.bidQueues ?? raw.bid_queues ?? brokerQueue?.bid ?? (side === 'bid' ? raw.queues : undefined)
+  if (queueInputHasRows(bidInput)) {
     message.bidQueues = normalizeQueueArray(
-      raw.bidQueues ?? raw.bid_queues ?? brokerQueue?.bid ?? raw.queues,
+      bidInput,
       'bid',
     )
   }
@@ -229,6 +235,7 @@ function normalizeHoldingHistoryMessage(symbol: string, raw: JsonRecord): Holdin
   return {
     type: 'holding_name_click_response',
     symbol,
+    runtimeEpoch: runtimeEpochValue(raw),
     participantName,
     days,
     history: compactMap(arrayValue(raw.history ?? raw.data), (item, index) =>
@@ -285,6 +292,7 @@ function normalizeTick(raw: JsonRecord, index: number, fallbackTimestamp?: strin
     replace:
       booleanValue(raw.replace ?? raw.replace_bar ?? raw.is_confirmed_minute_bar ?? raw.confirmed) ??
       hasMinuteBarShape(raw),
+    chartUpdate: booleanValue(raw.chartUpdate ?? raw.chart_update) ?? undefined,
   }
 }
 
@@ -311,9 +319,18 @@ function normalizeAlert(raw: JsonRecord, index: number, fallbackTimestamp?: stri
     participantName,
     brokerName: stringValue(raw.brokerName ?? raw.broker_name ?? raw.broker) ?? participantName,
     brokerCode: stringValue(raw.brokerCode ?? raw.broker_code) ?? undefined,
+    sourceKind: stringValue(raw.sourceKind ?? raw.source_kind) ?? undefined,
+    sourceTable: stringValue(raw.sourceTable ?? raw.source_table) ?? undefined,
+    sourceEventId: stringValue(raw.sourceEventId ?? raw.source_event_id) ?? undefined,
+    tradeId: stringValue(raw.tradeId ?? raw.trade_id) ?? undefined,
+    rowHash: stringValue(raw.rowHash ?? raw.row_hash) ?? undefined,
     remark: stringValue(raw.remark) ?? undefined,
     isHighlighted: booleanValue(raw.isHighlighted ?? raw.highlighted) ?? isHighlightedParticipant(participantName),
   }
+}
+
+function queueInputHasRows(input: unknown): boolean {
+  return Array.isArray(input) && input.some((item) => recordValue(item) !== null)
 }
 
 function normalizeQueueArray(input: unknown, side: QueueSide): BrokerQueueEntry[] {
@@ -321,6 +338,8 @@ function normalizeQueueArray(input: unknown, side: QueueSide): BrokerQueueEntry[
     const raw = recordValue(item) ?? {}
     const position = numberValue(raw.position ?? raw.rank) || index + 1
     const brokerCode = queueBrokerCode(raw.brokerCode ?? raw.broker_code ?? raw.code)
+    const volume = nullableNumberValue(raw.volume ?? raw.qty ?? raw.quantity)
+    const levelVolume = nullableNumberValue(raw.levelVolume ?? raw.level_volume ?? raw.depthVolume ?? raw.depth_volume)
     return {
       id: stringValue(raw.id) ?? `${side}-${position}-${brokerCode}-${index}`,
       position,
@@ -330,7 +349,13 @@ function normalizeQueueArray(input: unknown, side: QueueSide): BrokerQueueEntry[
       ),
       brokerCode,
       price: numberValue(raw.price) || 0,
-      volume: numberValue(raw.volume ?? raw.qty ?? raw.quantity) || 0,
+      volume,
+      volumeUnknown: booleanValue(raw.volumeUnknown ?? raw.volume_unknown) ?? volume === null,
+      levelVolume,
+      depthPosition: numberValue(raw.depthPosition ?? raw.depth_position) || undefined,
+      depthAvailable: booleanValue(raw.depthAvailable ?? raw.depth_available) ?? levelVolume !== null,
+      brokerCountAtPrice: numberValue(raw.brokerCountAtPrice ?? raw.broker_count_at_price) || undefined,
+      isDepthLevel: booleanValue(raw.isDepthLevel ?? raw.is_depth_level) ?? undefined,
     }
   })
 }
@@ -406,6 +431,7 @@ function normalizeFreshness(raw: JsonRecord, fallbackTimestamp?: string | null):
     effectiveTradeDate:
       stringValue(raw.effectiveTradeDate ?? raw.effective_trade_date) ?? undefined,
     runtimeState: stringValue(raw.runtimeState ?? raw.runtime_state) ?? undefined,
+    runtimeEpoch: runtimeEpochValue(raw),
     sourceDates: sourceDates
       ? Object.fromEntries(
           Object.entries(sourceDates).flatMap(([key, value]) => {
@@ -415,6 +441,10 @@ function normalizeFreshness(raw: JsonRecord, fallbackTimestamp?: string | null):
         )
       : {},
   }
+}
+
+function runtimeEpochValue(raw: JsonRecord): string | undefined {
+  return stringValue(raw.runtimeEpoch ?? raw.runtime_epoch) ?? undefined
 }
 
 function parseRecord(input: unknown): JsonRecord | null {
@@ -499,6 +529,14 @@ function numberValue(input: unknown): number {
   }
 
   return 0
+}
+
+function nullableNumberValue(input: unknown): number | null {
+  if (input === null || input === undefined || input === '') {
+    return null
+  }
+  const parsed = numberValue(input)
+  return parsed > 0 ? parsed : null
 }
 
 function booleanValue(input: unknown): boolean | null {

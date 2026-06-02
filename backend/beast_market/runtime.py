@@ -418,10 +418,20 @@ def normalize_xtquant_callback(payload: dict[str, Any]) -> dict[str, Any]:
 
     if period in {"hktransaction", "trade_tick", "tick"}:
         tick_payload = normalize_legacy_tick(data)
+        normalized_period = "trade_tick" if period == "trade_tick" else "hktransaction"
+        if normalized_period == "trade_tick":
+            tick_payload["source_kind"] = "canonical_trade_tick"
+            tick_payload["source_table"] = str(tick_payload.get("source_table") or "trade_ticks")
+            tick_payload["source_event_id"] = str(
+                tick_payload.get("source_event_id")
+                or tick_payload.get("row_hash")
+                or tick_payload.get("trade_id")
+                or ""
+            )
         return {
             "kind": "tick",
             "symbol": symbol,
-            "period": "hktransaction",
+            "period": normalized_period,
             "source_ts": tick_payload.pop("timestamp"),
             "payload": tick_payload,
         }
@@ -514,6 +524,13 @@ def normalize_legacy_tick(data: dict[str, Any]) -> dict[str, Any]:
         ("participant_name", "participant_name"),
         ("BrokerName", "broker_name"),
         ("broker_name", "broker_name"),
+        ("tradeID", "trade_id"),
+        ("trade_id", "trade_id"),
+        ("seq", "trade_id"),
+        ("row_hash", "row_hash"),
+        ("source_kind", "source_kind"),
+        ("source_table", "source_table"),
+        ("source_event_id", "source_event_id"),
     ):
         if source_key in data and data[source_key] is not None:
             result[target_key] = data[source_key]
@@ -534,14 +551,15 @@ def normalize_legacy_broker_queue(data: dict[str, Any]) -> list[dict[str, Any]]:
             if not isinstance(queue, dict):
                 continue
             brokers = queue.get("Brokers") or queue.get("brokers") or []
-            volumes = queue.get("Volumes") or queue.get("volumes") or []
+            volumes_present = "Volumes" in queue or "volumes" in queue
+            volumes = queue.get("Volumes") if "Volumes" in queue else queue.get("volumes")
             price = queue.get("Price") or queue.get("price")
             if not isinstance(brokers, list):
                 brokers = []
             if not isinstance(volumes, list):
                 volumes = []
             for index, broker in enumerate(brokers):
-                volume = volumes[index] if index < len(volumes) else 0
+                volume = volumes[index] if volumes_present and index < len(volumes) else None
                 entries.append(
                     {
                         "id": f"{side}-{queue_index + 1}-{index + 1}",
@@ -549,7 +567,7 @@ def normalize_legacy_broker_queue(data: dict[str, Any]) -> list[dict[str, Any]]:
                         "side": side,
                         "broker_code": str(broker or ""),
                         "price": float(price or 0),
-                        "volume": int(float(volume or 0)),
+                        "volume": nullable_positive_int(volume),
                     }
                 )
     return entries
@@ -562,7 +580,7 @@ def normalize_broker_queue_entry(item: dict[str, Any], index: int) -> dict[str, 
         "side": str(item.get("side") or "bid").lower(),
         "broker_code": str(item.get("broker_code") or item.get("brokerCode") or item.get("BrokerID") or ""),
         "price": float(item.get("price") or item.get("Price") or 0),
-        "volume": int(float(item.get("volume") or item.get("Volume") or item.get("qty") or 0)),
+        "volume": nullable_positive_int(first_present(item, "volume", "Volume", "qty", "quantity")),
     }
 
 
@@ -575,9 +593,9 @@ def normalize_legacy_l2_order_book(symbol: str, data: dict[str, Any]) -> dict[st
         candidate = nested
 
     ask_prices = first_present(candidate, "AskPrice", "askPrice", "ask_price") or []
-    ask_volumes = first_present(candidate, "AskVolume", "askVolume", "ask_volume") or []
+    ask_volumes = first_present(candidate, "AskVolume", "askVolume", "ask_volume", "AskVol", "askVol", "ask_vol") or []
     bid_prices = first_present(candidate, "BidPrice", "bidPrice", "bid_price") or []
-    bid_volumes = first_present(candidate, "BidVolume", "bidVolume", "bid_volume") or []
+    bid_volumes = first_present(candidate, "BidVolume", "bidVolume", "bid_volume", "BidVol", "bidVol", "bid_vol") or []
     ask_counts = first_present(candidate, "AskOrderCount", "askOrderCount", "AskCount", "askCount") or []
     bid_counts = first_present(candidate, "BidOrderCount", "bidOrderCount", "BidCount", "bidCount") or []
     return {
@@ -627,6 +645,16 @@ def first_present(data: dict[str, Any], *keys: str) -> Any:
         if key in data and data[key] is not None:
             return data[key]
     return None
+
+
+def nullable_positive_int(value: Any) -> int | None:
+    if value in (None, ""):
+        return None
+    try:
+        parsed = int(float(value))
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
 
 
 def infer_period(data: dict[str, Any]) -> str:

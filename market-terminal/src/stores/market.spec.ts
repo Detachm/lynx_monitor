@@ -282,6 +282,108 @@ describe('market store', () => {
     })
   })
 
+  it('clears stale symbol state on runtime epoch change and waits for the new snapshot', async () => {
+    const store = useMarketStore()
+    await store.subscribeSymbol('00700')
+    store.handleMessage({
+      type: 'snapshot',
+      symbol: '00700.HK',
+      runtimeEpoch: 'epoch-1',
+      snapshot: makeSnapshot('00700.HK', 388),
+      ticks: [makeTick(388.4)],
+      alerts: [makeAlert('alert-1')],
+      askQueues: [makeQueue('ask-1', 'ask')],
+      bidQueues: [],
+      holding: [],
+      freshness: {
+        updatedAt: '2026-05-22T09:30:00+08:00',
+        runtimeState: 'LIVE',
+        degraded: false,
+        degradedReasons: [],
+        sourceDates: { minute_bars: '20260522' },
+      },
+    })
+
+    store.handleMessage({
+      type: 'queue_realtime',
+      symbol: '00700.HK',
+      runtimeEpoch: 'epoch-2',
+      askQueues: [makeQueue('ask-new', 'ask')],
+    })
+
+    expect(store.symbols['00700.HK']!).toMatchObject({
+      runtimeEpoch: 'epoch-2',
+      snapshot: null,
+      ticks: [],
+      alerts: [],
+      askQueues: [],
+      snapshotLoaded: false,
+      subscriptionStatus: 'loading',
+    })
+
+    store.handleMessage({
+      type: 'snapshot',
+      symbol: '00700.HK',
+      runtimeEpoch: 'epoch-2',
+      snapshot: makeSnapshot('00700.HK', 389),
+      ticks: [makeTick(389)],
+      alerts: [],
+      askQueues: [],
+      bidQueues: [],
+      holding: [],
+      freshness: {
+        updatedAt: '2026-05-22T09:31:00+08:00',
+        runtimeState: 'LIVE',
+        degraded: false,
+        degradedReasons: [],
+        sourceDates: { minute_bars: '20260522' },
+      },
+    })
+
+    expect(store.symbols['00700.HK']!.snapshot?.price).toBe(389)
+    expect(store.symbols['00700.HK']!.ticks).toHaveLength(1)
+    expect(store.symbols['00700.HK']!.snapshotLoaded).toBe(true)
+  })
+
+  it('ignores anomalous non-replace realtime tick volume above the current snapshot volume', async () => {
+    const store = useMarketStore()
+    const samples: MarketPerformanceSample[] = []
+    store.setPerformanceSampleHandler((sample) => samples.push(sample))
+    await store.subscribeSymbol('00700')
+    store.handleMessage({
+      type: 'snapshot',
+      symbol: '00700.HK',
+      snapshot: makeSnapshot('00700.HK', 388),
+      ticks: [makeTick(388.4, '2026-05-22T09:30:00+08:00')],
+      alerts: [],
+      askQueues: [],
+      bidQueues: [],
+      holding: [],
+      freshness: {
+        updatedAt: '2026-05-22T09:30:00+08:00',
+        runtimeState: 'LIVE',
+        degraded: false,
+        degradedReasons: [],
+        requestedTradeDate: '20260522',
+        effectiveTradeDate: '20260522',
+        sourceDates: { minute_bars: '20260522' },
+      },
+    })
+
+    store.handleMessage({
+      type: 'tick_realtime',
+      symbol: '00700.HK',
+      tick: {
+        ...makeTick(389, '2026-05-22T09:30:05+08:00'),
+        volume: 4_000_000_000,
+        turnover: 1_556_000_000_000,
+      },
+    })
+
+    expect(store.symbols['00700.HK']!.ticks[0]?.volume).toBe(1000)
+    expect(samples.some((sample) => sample.key === 'realtime_tick_volume_anomaly')).toBe(true)
+  })
+
   it('sorts and deduplicates snapshot minute bars with mixed timezone encodings', async () => {
     const store = useMarketStore()
     await store.subscribeSymbol('00700')

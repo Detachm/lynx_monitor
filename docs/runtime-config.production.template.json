@@ -27,6 +27,10 @@
     "kafka_retries": 3,
     "symbol_eviction_grace_seconds": 300,
     "max_concurrent_hydrations": 8,
+    "max_raw_records_per_tick": 50,
+    "startup_intraday_recovery": true,
+    "persist_realtime_events": true,
+    "commit_runtime_owned_raw_offsets": true,
     "big_trade_volume_baseline_ratio": 0.0005,
     "install_signal_handlers": true
   },

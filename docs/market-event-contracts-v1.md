@@ -32,7 +32,7 @@ Additional fields:
 
 Kafka key: canonical `symbol`; raw consumers reject records whose key is not canonical or does not exactly match the event `symbol`.
 
-Raw payloads keep source-specific detail, but must include normalized identifiers needed downstream. `tick` payloads require finite numeric `price`, `volume`, and `turnover`; `price` must be positive, while `volume` and `turnover` must be non-negative. `broker_queue.entries` and `l2_order_book.ask`/`bid` must be arrays of objects. No source callback may silently drop a raw event; rejected events go to metrics and a dead-letter/spool path.
+Raw payloads keep source-specific detail, but must include normalized identifiers needed downstream. `tick` payloads require finite numeric `price`, `volume`, and `turnover`; `price` must be positive, while `volume` and `turnover` must be non-negative. A tick may create big-trade alerts only when its payload also carries `source_kind="canonical_trade_tick"` plus at least one provenance field among `trade_id`, `row_hash`, or `source_event_id`. Ordinary `hktransaction` ticks without that canonical marker are price/latest-state inputs only. `broker_queue.entries` and `l2_order_book.ask`/`bid` must be arrays of objects. No source callback may silently drop a raw event; rejected events go to metrics and a dead-letter/spool path.
 
 ## ProcessedMarketEvent v1
 
@@ -49,6 +49,8 @@ Kafka key: canonical `symbol`; processed consumers reject records whose key is n
 
 Processed payloads are computed business results from Octopus and may be written both to Kafka and Redis terminal snapshot keys.
 `snapshot` and `l2_order_book` payloads use the snapshot payload shape; `big_trade_alert.alert` and `broker_queue.broker_queue` must be objects.
+
+`big_trade_alert.alert` must be derived from a canonical trade tick and carry `source_kind`, `source_table`, `source_event_id`, and optional `trade_id`/`row_hash`.
 
 Architecture note: `processed_market_events_v1` is a valid contract for shadow runs, audit, and downstream integrations. The target terminal runtime does not require Gateway to depend on this topic as the only path to state; Gateway may receive deltas directly from the owning `SymbolRuntime` while Redis remains the first-screen read model.
 
@@ -87,12 +89,14 @@ fields are transitional only below that boundary.
 | `ccass_holdings` | array | yes |
 | `freshness` | object | yes |
 
+Broker queue entries use `volume: number | null` and `volume_unknown: boolean`. Depth-enriched queue entries may include `levelVolume: number | null`, `depthPosition`, and `depthAvailable`. Broker volume and price-level depth volume are separate fields.
+
 ### Realtime Payloads
 
 | Type | Payload fields |
 | --- | --- |
 | `tick_realtime` | object `tick`, optional object `snapshot`, optional `freshness` |
-| `alert_realtime` | object `alert`, optional `freshness` |
+| `alert_realtime` | canonical trade-tick-derived object `alert`, optional `freshness` |
 | `queue_realtime` | optional `side`, object `broker_queue` with `ask` and/or `bid`, optional `freshness` |
 | `holding_name_click_response` | non-empty string `participant_name`, positive integer `days`, array `history`, optional `freshness` |
 

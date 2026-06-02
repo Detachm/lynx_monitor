@@ -118,6 +118,7 @@ class SymbolRuntimeManager:
         active_pool_manager: Any | None = None,
         eviction_grace_seconds: float = 300,
         max_concurrent_hydrations: int = 8,
+        runtime_epoch: str = "",
         now: Clock | None = None,
     ) -> None:
         if max_concurrent_hydrations < 1:
@@ -134,6 +135,7 @@ class SymbolRuntimeManager:
         self.active_pool_manager = active_pool_manager
         self.eviction_grace_seconds = eviction_grace_seconds
         self.max_concurrent_hydrations = max_concurrent_hydrations
+        self.runtime_epoch = runtime_epoch or now_iso()
         self.now = now or time.monotonic
         self.runtimes: dict[str, SymbolRuntime] = {}
         self._hydrating: set[HydrationKey] = set()
@@ -292,11 +294,12 @@ class SymbolRuntimeManager:
                     runtime.snapshot_payload["snapshot"] = snapshot
                 if isinstance(tick, dict):
                     trade_date = terminal_payload_trade_date(payload, runtime.snapshot_payload, self.trade_date)
-                    runtime.snapshot_payload["minute_bars"] = upsert_minute_bar(
-                        runtime.snapshot_payload.get("minute_bars"),
-                        tick,
-                        trade_date=trade_date,
-                    )
+                    if tick.get("chart_update") is not False:
+                        runtime.snapshot_payload["minute_bars"] = upsert_minute_bar(
+                            runtime.snapshot_payload.get("minute_bars"),
+                            tick,
+                            trade_date=trade_date,
+                        )
                 self._update_freshness(runtime, payload)
                 applied = True
             elif message_type == "alert_realtime":
@@ -777,7 +780,7 @@ class SymbolRuntimeManager:
         source_ts: str | None = None,
     ) -> dict[str, Any]:
         self.seq_by_symbol[symbol] += 1
-        return make_terminal_message(
+        message = make_terminal_message(
             message_type=message_type,
             symbol=symbol,
             source="symbol-runtime",
@@ -785,6 +788,8 @@ class SymbolRuntimeManager:
             source_ts=source_ts,
             payload=payload,
         )
+        message["runtime_epoch"] = self.runtime_epoch
+        return message
 
     def _publish_state(self, symbol: str, state_payload: dict[str, Any] | None) -> None:
         if self.state_sink is None or state_payload is None:

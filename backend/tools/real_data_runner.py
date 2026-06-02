@@ -662,10 +662,17 @@ def replay_historical_alert_ticks(
             kind="tick",
             symbol=symbol,
             source="mammoth-real-data-runner",
-            period="hktransaction",
+            period="trade_tick",
             seq=seq,
             source_ts=str(row["tick_ts"]),
             payload={
+                "source_kind": "canonical_trade_tick",
+                "source_table": "trade_ticks",
+                "source_event_id": clean_str(
+                    row.get("row_hash")
+                    or row.get("trade_id")
+                    or f"{symbol}-{effective_trade_date}-{seq}"
+                ),
                 "price": clean_float(row["price"]),
                 "volume": clean_int(row["volume"]),
                 "turnover": clean_float(row["turnover"]),
@@ -686,6 +693,7 @@ def replay_historical_alert_ticks(
                 "supplemental_order_id": clean_str(row.get("supplemental_order_id")),
                 "broker_code_source": clean_str(row.get("broker_code_source")),
                 "trade_id": clean_str(row.get("trade_id")),
+                "row_hash": clean_str(row.get("row_hash")),
             },
             event_id=f"raw-mammoth-real-{symbol}-{effective_trade_date}-{seq}",
         )

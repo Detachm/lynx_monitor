@@ -96,6 +96,47 @@ describe('normalizeMarketMessage', () => {
     expect(queue.askQueues).toBeUndefined()
   })
 
+  it('keeps unknown broker volume null and reads available level depth totals', () => {
+    const message = normalizeMarketMessage({
+      schema_version: 1,
+      type: 'queue_realtime',
+      event_id: 'queue-00700.HK-depth',
+      symbol: '00700.HK',
+      source: 'gateway',
+      source_ts: '2026-05-22T09:30:00.000+08:00',
+      ingest_ts: '2026-05-22T09:30:00.020+08:00',
+      runtime_epoch: 'epoch-1',
+      seq: 2,
+      payload: {
+        broker_queue: {
+          ask: [
+            {
+              position: 1,
+              broker_code: 'UBS',
+              participant_name: 'UBS',
+              price: 388.6,
+              volume: null,
+              levelVolume: 120000,
+              depthPosition: 1,
+              depthAvailable: true,
+            },
+          ],
+        },
+      },
+    })
+
+    const queue = message as QueueRealtimeMessage
+
+    expect(queue.runtimeEpoch).toBe('epoch-1')
+    expect(queue.askQueues?.[0]).toMatchObject({
+      volume: null,
+      volumeUnknown: true,
+      levelVolume: 120000,
+      depthPosition: 1,
+      depthAvailable: true,
+    })
+  })
+
   it('normalizes queue participant placeholders to undisclosed display', () => {
     const message = normalizeMarketMessage({
       schema_version: 1,

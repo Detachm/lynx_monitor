@@ -7,6 +7,8 @@ export function createInitialTerminalHealth(): TerminalHealthStatus {
     redis: 'unknown',
     kafkaLag: null,
     latestEventAtBySymbol: {},
+    tradeTickSourceAvailable: undefined,
+    tradeTickSourceAvailableBySymbol: {},
     symbolFreshness: {},
     updatedAt: new Date(0).toISOString(),
   }
@@ -27,6 +29,10 @@ export class TerminalHealthTracker {
       latestEventAtBySymbol: {
         ...this.status.latestEventAtBySymbol,
         ...patch.latestEventAtBySymbol,
+      },
+      tradeTickSourceAvailableBySymbol: {
+        ...this.status.tradeTickSourceAvailableBySymbol,
+        ...patch.tradeTickSourceAvailableBySymbol,
       },
       symbolFreshness: {
         ...this.status.symbolFreshness,
@@ -64,6 +70,9 @@ function cloneStatus(status: TerminalHealthStatus): TerminalHealthStatus {
     ...status,
     latestEventAtBySymbol: {
       ...status.latestEventAtBySymbol,
+    },
+    tradeTickSourceAvailableBySymbol: {
+      ...status.tradeTickSourceAvailableBySymbol,
     },
     symbolFreshness: {
       ...status.symbolFreshness,

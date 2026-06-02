@@ -127,8 +127,10 @@ class BeastMarketRuntime:
     symbol_runtime_manager: SymbolRuntimeManager
     session_manager: GatewayV2SessionManager
     websocket_service: GatewayV2WebSocketService
+    runtime_epoch: str = field(default_factory=now_iso)
     effective_trade_date_by_symbol: dict[str, str] = field(default_factory=dict)
     startup_cache_read_errors_by_symbol: dict[str, str] = field(default_factory=dict)
+    intraday_recovery_by_symbol: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 @dataclass
@@ -242,7 +244,7 @@ class BeastMarketRuntimeSupervisor:
             self._transition(RuntimeLifecycleState.RECOVERING_INTRADAY)
             for symbol in symbol_list:
                 if self.runtime.config.startup_intraday_recovery:
-                    recover_symbol_intraday(
+                    self.runtime.intraday_recovery_by_symbol[symbol] = recover_symbol_intraday(
                         self.runtime,
                         symbol,
                         cached_snapshot=cached_snapshots.get(symbol),
@@ -580,6 +582,7 @@ def build_beast_market_runtime(
     config: BeastMarketRuntimeConfig,
     clients: BeastMarketRuntimeClients,
 ) -> BeastMarketRuntime:
+    runtime_epoch = now_iso()
     kafka_adapter = KafkaEventBusAdapter(
         clients.kafka_producer,
         clients.kafka_consumer,
@@ -632,7 +635,7 @@ def build_beast_market_runtime(
             reason=dead_letter.reason,
         ),
     )
-    gateway = GatewayV2(event_bus, cache)
+    gateway = GatewayV2(event_bus, cache, runtime_epoch=runtime_epoch)
     if kafka_client_degraded(clients.kafka_producer) or kafka_client_degraded(clients.kafka_consumer):
         collector.health.kafka = "degraded"
         octopus.health.kafka = "degraded"
@@ -656,6 +659,7 @@ def build_beast_market_runtime(
         active_pool_manager=active_pool_manager,
         eviction_grace_seconds=config.active_pool.eviction_grace_seconds,
         max_concurrent_hydrations=config.max_concurrent_hydrations,
+        runtime_epoch=runtime_epoch,
     )
     raw_consumer_worker.state_provider = symbol_runtime_manager.snapshot_payload
     raw_consumer_worker.runtime_event_processor = (
@@ -698,6 +702,7 @@ def build_beast_market_runtime(
         symbol_runtime_manager=symbol_runtime_manager,
         session_manager=session_manager,
         websocket_service=websocket_service,
+        runtime_epoch=runtime_epoch,
     )
     symbol_runtime_manager.attach_realtime = live_attach_symbol(
         subscription_manager,
@@ -926,6 +931,23 @@ def seed_symbol_from_market_full_tick(runtime: BeastMarketRuntime, symbol: str) 
     for event in processed:
         runtime.runtime_state.append_processed_event(runtime.config.trade_date, symbol, event)
     runtime.symbol_runtime_manager.apply_processed_events(processed)
+    depth_payload = full_tick_l2_payload(full_tick)
+    if depth_payload is not None:
+        depth_event = make_raw_market_event(
+            kind="l2_order_book",
+            symbol=symbol,
+            source="xtquant_full_tick",
+            seq=runtime.octopus.seq_by_symbol.get(symbol, 0) + 1,
+            source_ts=full_tick_source_ts(full_tick),
+            payload=depth_payload,
+            period="full_tick",
+        )
+        depth_processed = runtime.octopus.process_raw_event(depth_event, runtime.config.trade_date)
+        runtime.runtime_state.append_raw_event(runtime.config.trade_date, symbol, depth_event)
+        for event in depth_processed:
+            runtime.runtime_state.append_processed_event(runtime.config.trade_date, symbol, event)
+        runtime.symbol_runtime_manager.apply_processed_events(depth_processed)
+        processed.extend(depth_processed)
     return processed
 
 
@@ -982,6 +1004,52 @@ def full_tick_source_ts(full_tick: dict[str, Any]) -> str:
         except ValueError:
             pass
     return normalize_source_timestamp(full_tick.get("time") or full_tick.get("timestamp"))
+
+
+def full_tick_l2_payload(full_tick: dict[str, Any]) -> dict[str, list[dict[str, Any]]] | None:
+    ask_prices = first_sequence(full_tick, "askPrice", "AskPrice", "ask_price")
+    ask_volumes = first_sequence(full_tick, "askVol", "AskVol", "askVolume", "AskVolume", "ask_volume")
+    bid_prices = first_sequence(full_tick, "bidPrice", "BidPrice", "bid_price")
+    bid_volumes = first_sequence(full_tick, "bidVol", "BidVol", "bidVolume", "BidVolume", "bid_volume")
+    ask = depth_levels_from_full_tick(ask_prices, ask_volumes, "ask")
+    bid = depth_levels_from_full_tick(bid_prices, bid_volumes, "bid")
+    if not ask and not bid:
+        return None
+    return {"ask": ask, "bid": bid}
+
+
+def first_sequence(data: dict[str, Any], *keys: str) -> list[Any]:
+    for key in keys:
+        value = data.get(key)
+        if isinstance(value, (list, tuple)):
+            return list(value)
+    return []
+
+
+def depth_levels_from_full_tick(prices: list[Any], volumes: list[Any], side: str) -> list[dict[str, Any]]:
+    levels: list[dict[str, Any]] = []
+    for index, price in enumerate(prices[:5]):
+        try:
+            price_value = float(price)
+        except (TypeError, ValueError):
+            continue
+        if price_value <= 0:
+            continue
+        volume = volumes[index] if index < len(volumes) else 0
+        try:
+            volume_value = int(float(volume or 0))
+        except (TypeError, ValueError):
+            volume_value = 0
+        levels.append(
+            {
+                "position": index + 1,
+                "side": side,
+                "price": price_value,
+                "volume": volume_value,
+                "order_count": 0,
+            }
+        )
+    return levels
 
 
 def mark_snapshot_degraded(snapshot: dict[str, Any], reason: str) -> dict[str, Any]:
@@ -1094,7 +1162,8 @@ def recover_symbol_intraday(
     seen = set()
     last_recovered_ts = ""
 
-    if cached_snapshot is not None and is_terminal_snapshot_fresh(cached_snapshot, state_trade_date):
+    cached_snapshot_used = cached_snapshot is not None and is_terminal_snapshot_fresh(cached_snapshot, state_trade_date)
+    if cached_snapshot_used:
         runtime.octopus.set_state(symbol, cached_snapshot)
         runtime.symbol_runtime_manager.seed_snapshot(symbol, cached_snapshot)
         try:
@@ -1104,26 +1173,29 @@ def recover_symbol_intraday(
             runtime.octopus.health.redis = "degraded"
             mark_snapshot_degraded(cached_snapshot, f"redis_terminal_snapshot_write_failed: {error}")
             runtime.symbol_runtime_manager.seed_snapshot(symbol, cached_snapshot)
-        last_recovered_ts = snapshot_recovered_ts(cached_snapshot)
     else:
         current_snapshot = runtime.octopus.get_state(symbol)
         if isinstance(current_snapshot, dict):
             runtime.symbol_runtime_manager.seed_snapshot(symbol, current_snapshot)
-        for raw_event in sorted(runtime.runtime_state.load_raw_events(state_trade_date, symbol), key=raw_event_sort_key):
-            keys = raw_event_dedupe_keys(raw_event)
-            if any(key in seen for key in keys):
-                continue
-            for key in keys:
-                seen.add(key)
-            processed = process_recovery_raw_event(runtime, raw_event, request_trade_date)
-            replayed_local_raw += 1
-            recovered_processed += len(processed)
-            runtime_processed_applied += runtime.symbol_runtime_manager.apply_processed_events(processed)
-            for processed_event in processed:
-                runtime.runtime_state.append_processed_event(state_trade_date, symbol, processed_event)
-            source_ts = str(raw_event.get("source_ts") or "")
-            if source_ts and iso_after(source_ts, last_recovered_ts):
-                last_recovered_ts = source_ts
+
+    for raw_event in sorted(runtime.runtime_state.load_raw_events(state_trade_date, symbol), key=raw_event_sort_key):
+        keys = raw_event_dedupe_keys(raw_event)
+        if any(key in seen for key in keys):
+            continue
+        for key in keys:
+            seen.add(key)
+        processed = process_recovery_raw_event(runtime, raw_event, request_trade_date)
+        replayed_local_raw += 1
+        recovered_processed += len(processed)
+        runtime_processed_applied += runtime.symbol_runtime_manager.apply_processed_events(processed)
+        for processed_event in processed:
+            runtime.runtime_state.append_processed_event(state_trade_date, symbol, processed_event)
+        source_ts = str(raw_event.get("source_ts") or "")
+        if processed and source_ts and iso_after(source_ts, last_recovered_ts):
+            last_recovered_ts = source_ts
+
+    if not last_recovered_ts and cached_snapshot_used:
+        last_recovered_ts = snapshot_recovered_ts(cached_snapshot)
 
     for raw_event in backfill_trade_tick_events(runtime, symbol, last_recovered_ts, trade_date=state_trade_date):
         keys = raw_event_dedupe_keys(raw_event)
@@ -1144,7 +1216,7 @@ def recover_symbol_intraday(
         "symbol": symbol,
         "requested_trade_date": request_trade_date,
         "effective_trade_date": state_trade_date,
-        "cached_snapshot_used": cached_snapshot is not None and is_terminal_snapshot_fresh(cached_snapshot, state_trade_date),
+        "cached_snapshot_used": cached_snapshot_used,
         "local_raw_replayed": replayed_local_raw,
         "backfilled_ticks": backfilled_ticks,
         "recovered_raw_events": recovered_raw,
@@ -1186,6 +1258,9 @@ def backfill_trade_tick_events(
             continue
         runtime.octopus.seq_by_symbol[symbol] += 1
         payload = {
+            "source_kind": "canonical_trade_tick",
+            "source_table": "trade_ticks",
+            "source_event_id": str(row.get("row_hash") or row.get("trade_id") or ""),
             "price": float(row["price"]),
             "volume": int(row["volume"]),
             "turnover": float(row["turnover"]),
@@ -1206,7 +1281,7 @@ def backfill_trade_tick_events(
                 kind="tick",
                 symbol=symbol,
                 source="mammoth",
-                period="hktransaction",
+                period="trade_tick",
                 seq=runtime.octopus.seq_by_symbol[symbol],
                 source_ts=tick_ts,
                 payload=payload,
@@ -1753,12 +1828,14 @@ def build_runtime_health_snapshot(
     processed_committed = runtime.kafka_adapter.committed_offset(processed_topic)
     subscription = subscription_snapshot(runtime.subscription_manager)
     redis_snapshot = redis_snapshot_probe(runtime)
+    realtime_recovery = realtime_recovery_snapshot(runtime)
     return {
         "schema_version": 1,
         "generated_at": generated_at or now_iso(),
         "trade_date": runtime.config.trade_date,
         "effective_trade_date_by_symbol": dict(runtime.effective_trade_date_by_symbol),
         "runtime_state": supervisor.stats.runtime_state,
+        "runtime_epoch": runtime.runtime_epoch,
         "runtime_state_root": str(runtime.config.runtime_state_root),
         "running": supervisor.running,
         "supervisor": asdict(supervisor.stats),
@@ -1799,6 +1876,12 @@ def build_runtime_health_snapshot(
         "symbol_runtime_manager": runtime.symbol_runtime_manager.manager_snapshot(),
         "symbol_runtime": runtime.symbol_runtime_manager.snapshot(),
         "redis_snapshot": redis_snapshot,
+        "realtime_recovery": realtime_recovery,
+        "trade_tick_replay_count": realtime_recovery["trade_tick_replay_count"],
+        "alert_count_by_symbol": realtime_recovery["alert_count_by_symbol"],
+        "trade_tick_source_available": realtime_recovery["trade_tick_source_available"],
+        "broker_queue_last_valid_ts": realtime_recovery["broker_queue_last_valid_ts_by_symbol"],
+        "depth_last_valid_ts": realtime_recovery["depth_last_valid_ts_by_symbol"],
         "gateway_websocket": {
             "host": runtime.websocket_service.host,
             "port": runtime.websocket_service.port,
@@ -1827,6 +1910,63 @@ def build_runtime_health_snapshot(
             "gateway": runtime.gateway.health.as_message()["payload"],
         },
     }
+
+
+def realtime_recovery_snapshot(runtime: BeastMarketRuntime) -> dict[str, Any]:
+    symbols = sorted(
+        {
+            *runtime.effective_trade_date_by_symbol.keys(),
+            *runtime.symbol_runtime_manager.runtimes.keys(),
+            *runtime.octopus.state_by_symbol.keys(),
+        }
+    )
+    replay_by_symbol: dict[str, int] = {}
+    alert_count_by_symbol: dict[str, int] = {}
+    source_available_by_symbol: dict[str, bool] = {}
+    broker_queue_last_valid_ts_by_symbol: dict[str, str] = {}
+    depth_last_valid_ts_by_symbol: dict[str, str] = {}
+    for symbol in symbols:
+        recovery = runtime.intraday_recovery_by_symbol.get(symbol, {})
+        replay_count = int(recovery.get("local_raw_replayed") or 0) + int(recovery.get("backfilled_ticks") or 0)
+        replay_by_symbol[symbol] = replay_count
+        state = runtime.symbol_runtime_manager.snapshot_payload(symbol) or runtime.octopus.get_state(symbol) or {}
+        alerts = state.get("alerts") if isinstance(state, dict) else []
+        alert_count_by_symbol[symbol] = len(alerts) if isinstance(alerts, list) else 0
+        source_available_by_symbol[symbol] = replay_count > 0 or trade_tick_source_available(runtime, symbol)
+        freshness = state.get("freshness") if isinstance(state, dict) and isinstance(state.get("freshness"), dict) else {}
+        broker_queue_last_valid_ts_by_symbol[symbol] = str(freshness.get("broker_queue_last_valid_ts") or "")
+        depth_last_valid_ts_by_symbol[symbol] = str(freshness.get("depth_last_valid_ts") or "")
+    return {
+        "trade_tick_replay_count": sum(replay_by_symbol.values()),
+        "trade_tick_replay_count_by_symbol": replay_by_symbol,
+        "alert_count_by_symbol": alert_count_by_symbol,
+        "trade_tick_source_available": any(source_available_by_symbol.values()),
+        "trade_tick_source_available_by_symbol": source_available_by_symbol,
+        "broker_queue_last_valid_ts_by_symbol": broker_queue_last_valid_ts_by_symbol,
+        "depth_last_valid_ts_by_symbol": depth_last_valid_ts_by_symbol,
+    }
+
+
+def trade_tick_source_available(runtime: BeastMarketRuntime, symbol: str) -> bool:
+    trade_date = runtime.effective_trade_date_by_symbol.get(symbol, runtime.config.trade_date)
+    try:
+        if any(is_trade_tick_raw_event(event) for event in runtime.runtime_state.load_raw_events(trade_date, symbol)):
+            return True
+    except Exception:
+        pass
+    try:
+        return bool(runtime.mammoth.get_trade_ticks(symbol, trade_date))
+    except Exception:
+        return False
+
+
+def is_trade_tick_raw_event(event: dict[str, Any]) -> bool:
+    payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+    return (
+        event.get("kind") == "tick"
+        and str(payload.get("source_kind") or "").strip() == "canonical_trade_tick"
+        and any(str(payload.get(key) or "").strip() for key in ("trade_id", "row_hash", "source_event_id"))
+    )
 
 
 def kafka_status_snapshot(runtime: BeastMarketRuntime) -> dict[str, Any]:

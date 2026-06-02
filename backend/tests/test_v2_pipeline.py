@@ -15,6 +15,7 @@ from beast_market import (
     OctopusComputeV2,
     RealtimeCollectorV2,
     make_raw_market_event,
+    normalize_xtquant_callback,
     validate_terminal_message,
 )
 from beast_market.pipeline import (
@@ -156,19 +157,12 @@ class BackendV2PipelineTest(unittest.TestCase):
             )
             octopus.preload_bod("00700.HK", "20260522")
 
-            big_trade = make_raw_market_event(
-                kind="tick",
-                symbol="00700.HK",
-                source="xtquant",
-                seq=1,
-                source_ts="2026-05-22T09:30:00+08:00",
-                payload={
-                    "price": 388.4,
-                    "volume": 100000,
-                    "turnover": 38840000,
-                    "side": "buy",
-                    "broker_code": "JPM",
-                },
+            big_trade = canonical_trade_tick(
+                1,
+                "2026-05-22T09:30:00+08:00",
+                388.4,
+                100000,
+                broker_code="JPM",
             )
             queue_update = make_raw_broker_queue(bus)
 
@@ -192,7 +186,7 @@ class BackendV2PipelineTest(unittest.TestCase):
             self.assertTrue(terminal[1]["payload"]["alert"]["isHighlighted"])
             self.assertEqual(terminal[2]["payload"]["broker_queue"]["bid"][0]["brokerCode"], "UBS")
 
-    def test_hktransaction_below_big_trade_threshold_updates_latest_bar_without_alert(self) -> None:
+    def test_hktransaction_below_big_trade_threshold_updates_price_without_chart_bar_or_alert(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_silver_tables(root)
@@ -227,12 +221,15 @@ class BackendV2PipelineTest(unittest.TestCase):
             self.assertEqual([event["result_type"] for event in processed], ["snapshot"])
             cached = cache.get_terminal_snapshot("20260522", "00700.HK")
             self.assertEqual(cached["snapshot"]["price"], 389.0)
-            self.assertEqual(cached["minute_bars"][0]["volume"], 1999)
+            self.assertEqual(cached["snapshot"]["volume"], 3000)
+            self.assertEqual(cached["minute_bars"][0]["volume"], 1000)
+            self.assertFalse(cached["last_tick"]["chart_update"])
             self.assertEqual(cached["alerts"], [])
             self.assertEqual(cached["freshness"]["source_dates"]["latest_bar"], "20260522")
+            self.assertEqual(cached["freshness"]["source_dates"]["trade_ticks"], "")
             self.assertEqual(octopus.health.latest_event_at_by_symbol["00700.HK"], "2026-05-22T09:30:05+08:00")
 
-    def test_hktransaction_big_trade_updates_latest_bar_and_alert_read_model(self) -> None:
+    def test_hktransaction_big_volume_without_canonical_provenance_updates_price_without_alert(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_silver_tables(root)
@@ -264,16 +261,88 @@ class BackendV2PipelineTest(unittest.TestCase):
 
             processed = octopus.process_raw_event(big_trade, "20260522")
 
+            self.assertEqual([event["result_type"] for event in processed], ["snapshot"])
+            cached = cache.get_terminal_snapshot("20260522", "00700.HK")
+            self.assertEqual(cached["snapshot"]["price"], 389.0)
+            self.assertEqual(cached["snapshot"]["volume"], 3000)
+            self.assertEqual(cached["minute_bars"][0]["volume"], 1000)
+            self.assertFalse(cached["last_tick"]["chart_update"])
+            self.assertEqual(cached["alerts"], [])
+            terminal = GatewayV2(bus, cache).to_terminal_messages()
+            self.assertEqual([message["type"] for message in terminal], ["tick_realtime"])
+            for message in terminal:
+                validate_terminal_message(message)
+
+    def test_canonical_trade_tick_big_trade_updates_latest_bar_and_alert_read_model(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_silver_tables(root)
+
+            bus = InMemoryEventBus()
+            cache = InMemoryRedisSnapshotCache()
+            octopus = OctopusComputeV2(
+                MammothAPI(root),
+                bus,
+                cache,
+                big_trade_volume_baseline_ratio=0.0005,
+            )
+            octopus.preload_bod("00700.HK", "20260522")
+            big_trade = canonical_trade_tick(
+                1,
+                "2026-05-22T09:30:05+08:00",
+                389.0,
+                100000,
+                broker_code="JPM",
+            )
+
+            processed = octopus.process_raw_event(big_trade, "20260522")
+
             self.assertEqual([event["result_type"] for event in processed], ["snapshot", "big_trade_alert"])
             cached = cache.get_terminal_snapshot("20260522", "00700.HK")
             self.assertEqual(cached["snapshot"]["price"], 389.0)
-            self.assertEqual(cached["minute_bars"][0]["volume"], 101000)
+            self.assertEqual(cached["snapshot"]["volume"], 3000)
+            self.assertEqual(cached["minute_bars"][0]["volume"], 1000)
+            self.assertFalse(cached["last_tick"]["chart_update"])
             self.assertEqual(cached["alerts"][0]["price"], 389.0)
             self.assertEqual(cached["alerts"][0]["participantName"], "JPMorgan Chase Bank, N.A.")
+            self.assertEqual(cached["alerts"][0]["source_kind"], "canonical_trade_tick")
+            self.assertEqual(cached["alerts"][0]["source_table"], "trade_ticks")
             terminal = GatewayV2(bus, cache).to_terminal_messages()
             self.assertEqual([message["type"] for message in terminal], ["tick_realtime", "alert_realtime"])
             for message in terminal:
                 validate_terminal_message(message)
+
+    def test_neutral_canonical_trade_tick_is_rejected_for_alerts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_silver_tables(root)
+
+            bus = InMemoryEventBus()
+            cache = InMemoryRedisSnapshotCache()
+            octopus = OctopusComputeV2(
+                MammothAPI(root),
+                bus,
+                cache,
+                big_trade_volume_baseline_ratio=0.0005,
+            )
+            octopus.preload_bod("00700.HK", "20260522")
+
+            processed = octopus.process_raw_event(
+                canonical_trade_tick(
+                    1,
+                    "2026-05-22T09:30:05+08:00",
+                    389.0,
+                    100000,
+                    side="neutral",
+                    broker_code="JPM",
+                ),
+                "20260522",
+            )
+
+        self.assertEqual([event["result_type"] for event in processed], ["snapshot"])
+        cached = cache.get_terminal_snapshot("20260522", "00700.HK")
+        self.assertEqual(cached["alerts"], [])
+        self.assertFalse(cached["last_tick"]["chart_update"])
 
     def test_first_same_day_tick_rolls_preopen_fallback_snapshot_to_live_session(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -409,19 +478,12 @@ class BackendV2PipelineTest(unittest.TestCase):
             )
             octopus.preload_bod("00700.HK", "20260522")
 
-            big_trade = make_raw_market_event(
-                kind="tick",
-                symbol="00700.HK",
-                source="xtquant",
-                seq=1,
-                source_ts="2026-05-22T09:30:00+08:00",
-                payload={
-                    "price": 388.4,
-                    "volume": 100000,
-                    "turnover": 38840000,
-                    "side": "buy",
-                    "broker_code": "101",
-                },
+            big_trade = canonical_trade_tick(
+                1,
+                "2026-05-22T09:30:00+08:00",
+                388.4,
+                100000,
+                broker_code="101",
             )
             octopus.process_raw_event(big_trade, "20260522")
 
@@ -444,20 +506,12 @@ class BackendV2PipelineTest(unittest.TestCase):
             )
             octopus.preload_bod("00700.HK", "20260522")
 
-            high_turnover_small_volume = make_raw_market_event(
-                kind="tick",
-                symbol="00700.HK",
-                source="xtquant",
-                period="hktransaction",
-                seq=1,
-                source_ts="2026-05-22T09:30:00+08:00",
-                payload={
-                    "price": 1_000_000.0,
-                    "volume": 10,
-                    "turnover": 10_000_000,
-                    "side": "buy",
-                    "broker_code": "JPM",
-                },
+            high_turnover_small_volume = canonical_trade_tick(
+                1,
+                "2026-05-22T09:30:00+08:00",
+                1_000_000.0,
+                10,
+                broker_code="JPM",
             )
             processed = octopus.process_raw_event(high_turnover_small_volume, "20260522")
 
@@ -478,21 +532,14 @@ class BackendV2PipelineTest(unittest.TestCase):
             )
             octopus.preload_bod("00700.HK", "20260522")
 
-            big_trade = make_raw_market_event(
-                kind="tick",
-                symbol="00700.HK",
-                source="xtquant",
-                seq=1,
-                source_ts="2026-05-22T09:30:00+08:00",
-                payload={
-                    "price": 388.4,
-                    "volume": 100000,
-                    "turnover": 38840000,
-                    "side": "buy",
-                    "broker_code": "0",
-                    "active_broker_code": "0",
-                    "trade_type": "101",
-                },
+            big_trade = canonical_trade_tick(
+                1,
+                "2026-05-22T09:30:00+08:00",
+                388.4,
+                100000,
+                broker_code="0",
+                active_broker_code="0",
+                trade_type="101",
             )
             octopus.process_raw_event(big_trade, "20260522")
 
@@ -515,23 +562,16 @@ class BackendV2PipelineTest(unittest.TestCase):
             )
             octopus.preload_bod("00700.HK", "20260522")
 
-            big_trade = make_raw_market_event(
-                kind="tick",
-                symbol="00700.HK",
-                source="xtquant",
-                seq=1,
-                source_ts="2026-05-22T09:30:00+08:00",
-                payload={
-                    "price": 388.4,
-                    "volume": 100000,
-                    "turnover": 38840000,
-                    "side": "buy",
-                    "broker_code": "-1",
-                    "participant_name": "中国投资",
-                    "broker_name": "中国投资",
-                    "active_broker_code": "6998",
-                    "broker_code_source": "activeBrokerNo",
-                },
+            big_trade = canonical_trade_tick(
+                1,
+                "2026-05-22T09:30:00+08:00",
+                388.4,
+                100000,
+                broker_code="-1",
+                participant_name="中国投资",
+                broker_name="中国投资",
+                active_broker_code="6998",
+                broker_code_source="activeBrokerNo",
             )
             octopus.process_raw_event(big_trade, "20260522")
 
@@ -571,7 +611,7 @@ class BackendV2PipelineTest(unittest.TestCase):
             self.assertEqual(cached["minute_bars"][1]["timestamp"], "2026-05-22T09:31:00+08:00")
             self.assertEqual(cached["minute_bars"][1]["volume"], 2300)
 
-    def test_confirmed_1m_bar_replaces_tick_aggregated_latest_bar(self) -> None:
+    def test_confirmed_1m_bar_appends_without_tick_aggregated_placeholder(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_silver_tables(root)
@@ -593,7 +633,8 @@ class BackendV2PipelineTest(unittest.TestCase):
                 ),
                 "20260522",
             )
-            self.assertEqual(octopus.get_state("00700.HK")["minute_bars"][-1]["volume"], 900)
+            self.assertEqual(octopus.get_state("00700.HK")["minute_bars"][-1]["volume"], 2000)
+            self.assertEqual(octopus.get_state("00700.HK")["last_tick"]["chart_update"], False)
 
             processed = octopus.process_raw_event(
                 make_raw_market_event(
@@ -664,8 +705,10 @@ class BackendV2PipelineTest(unittest.TestCase):
             self.assertEqual([event["result_type"] for event in first], ["snapshot"])
             self.assertEqual(second, [])
             self.assertEqual(len(bus.read(PROCESSED_TOPIC)), 1)
-            self.assertEqual(state["minute_bars"][-1]["volume"], 300)
-            self.assertEqual(state["minute_bars"][-1]["price"], 389.2)
+            self.assertEqual(state["snapshot"]["price"], 389.2)
+            self.assertEqual(state["minute_bars"][-1]["volume"], 2000)
+            self.assertEqual(state["last_tick"]["price"], 389.2)
+            self.assertFalse(state["last_tick"]["chart_update"])
 
     def test_octopus_applies_l2_order_book_enhancement_to_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -737,7 +780,7 @@ class BackendV2PipelineTest(unittest.TestCase):
             )
             external_state = copy.deepcopy(octopus.preload_bod("00700.HK", "20260522"))
             octopus.state_by_symbol.clear()
-            raw_event = raw_tick(seq=1, source_ts="2026-05-22T09:32:05+08:00", price=389.4, volume=100)
+            raw_event = canonical_trade_tick(1, "2026-05-22T09:32:05+08:00", 389.4, 100)
 
             processed = octopus.process_raw_event_with_state(raw_event, "20260522", external_state)
 
@@ -761,7 +804,7 @@ class BackendV2PipelineTest(unittest.TestCase):
                 big_trade_turnover_threshold=100_000_000,
             )
             state = octopus.preload_bod("00700.HK", "20260522")
-            raw_event = raw_tick(seq=1, source_ts="2026-05-22T09:32:05+08:00", price=389.4, volume=100)
+            raw_event = canonical_trade_tick(1, "2026-05-22T09:32:05+08:00", 389.4, 100)
 
             update = octopus.apply_tick_to_state(state, raw_event, "20260522")
 
@@ -893,6 +936,130 @@ class BackendV2PipelineTest(unittest.TestCase):
         self.assertEqual(update.broker_queue["ask"][1]["participantName"], "未披露")
         self.assertEqual(update.broker_queue["bid"][0]["participantName"], "集合竞价")
         self.assertEqual(update.broker_queue["bid"][1]["participantName"], "未披露")
+
+    def test_broker_queue_missing_broker_volume_stays_unknown(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_silver_tables(root)
+
+            bus = InMemoryEventBus()
+            octopus = OctopusComputeV2(MammothAPI(root), bus, InMemoryRedisSnapshotCache())
+            state = octopus.preload_bod("00700.HK", "20260522")
+            raw_event = RealtimeCollectorV2(bus).ingest_broker_queue(
+                "00700.HK",
+                {
+                    "timestamp": "2026-05-22T09:30:00+08:00",
+                    "entries": [
+                        {"side": "ask", "position": 1, "broker_code": "UBS", "price": 388.6},
+                    ],
+                },
+            )
+
+            update = octopus.apply_broker_queue_to_state(state, raw_event, "20260522")
+
+        self.assertIsNone(update.broker_queue["ask"][0]["volume"])
+        self.assertTrue(update.broker_queue["ask"][0]["volume_unknown"])
+        self.assertIsNone(update.state["broker_queue"]["ask"][0]["volume"])
+
+    def test_l2_depth_enriches_broker_queue_price_level_totals(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_silver_tables(root)
+
+            bus = InMemoryEventBus()
+            octopus = OctopusComputeV2(MammothAPI(root), bus, InMemoryRedisSnapshotCache())
+            state = octopus.preload_bod("00700.HK", "20260522")
+
+            octopus.apply_l2_order_book_to_state(state, make_raw_l2_order_book(bus), "20260522")
+            raw_event = RealtimeCollectorV2(bus).ingest_broker_queue(
+                "00700.HK",
+                {
+                    "timestamp": "2026-05-22T09:30:03+08:00",
+                    "entries": [
+                        {"side": "ask", "position": 1, "broker_code": "UBS", "price": 388.6},
+                        {"side": "bid", "position": 1, "broker_code": "JPM", "price": 388.3},
+                    ],
+                },
+            )
+
+            update = octopus.apply_broker_queue_to_state(state, raw_event, "20260522")
+
+        self.assertEqual(update.broker_queue["ask"][0]["levelVolume"], 1000)
+        self.assertEqual(update.broker_queue["ask"][0]["depthPosition"], 1)
+        self.assertTrue(update.broker_queue["ask"][0]["depthAvailable"])
+        self.assertEqual(update.broker_queue["bid"][0]["levelVolume"], 4000)
+        self.assertEqual(state["broker_queue"]["ask"][0]["levelVolume"], 1000)
+
+    def test_empty_broker_queue_update_does_not_overwrite_last_valid_queue(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_silver_tables(root)
+
+            bus = InMemoryEventBus()
+            cache = InMemoryRedisSnapshotCache()
+            octopus = OctopusComputeV2(MammothAPI(root), bus, cache)
+            octopus.preload_bod("00700.HK", "20260522")
+            before = copy.deepcopy(octopus.get_state("00700.HK")["broker_queue"])
+            raw_event = RealtimeCollectorV2(bus).ingest_broker_queue(
+                "00700.HK",
+                {
+                    "timestamp": "2026-05-22T09:30:05+08:00",
+                    "side": "bid",
+                    "entries": [],
+                },
+            )
+
+            processed = octopus.process_raw_event(raw_event, "20260522")
+
+        self.assertEqual(processed, [])
+        self.assertEqual(cache.get_terminal_snapshot("20260522", "00700.HK")["broker_queue"], before)
+
+    def test_all_zero_l2_depth_does_not_overwrite_last_valid_depth(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_silver_tables(root)
+
+            bus = InMemoryEventBus()
+            cache = InMemoryRedisSnapshotCache()
+            octopus = OctopusComputeV2(MammothAPI(root), bus, cache)
+            octopus.preload_bod("00700.HK", "20260522")
+            octopus.process_raw_event(make_raw_l2_order_book(bus), "20260522")
+            before = copy.deepcopy(cache.get_terminal_snapshot("20260522", "00700.HK")["l2_order_book"])
+            raw_event = RealtimeCollectorV2(bus).ingest_l2_order_book(
+                "00700.HK",
+                {
+                    "timestamp": "2026-05-22T09:30:06+08:00",
+                    "ask": [{"price": 0, "volume": 0}],
+                    "bid": [{"price": 0, "volume": 0}],
+                },
+            )
+
+            processed = octopus.process_raw_event(raw_event, "20260522")
+
+        self.assertEqual(processed, [])
+        self.assertEqual(cache.get_terminal_snapshot("20260522", "00700.HK")["l2_order_book"], before)
+
+    def test_legacy_broker_queue_zero_volumes_normalize_to_unknown(self) -> None:
+        normalized = normalize_xtquant_callback(
+            {
+                "symbol": "00700.HK",
+                "period": "hkbrokerqueueex",
+                "data": {
+                    "Time": "2026-05-22T09:30:00+08:00",
+                    "BidQueues": [
+                        {
+                            "Price": 388.2,
+                            "Brokers": ["UBS", "JPM"],
+                            "Volumes": [0, 0],
+                        }
+                    ],
+                },
+            }
+        )
+
+        self.assertEqual(normalized["kind"], "broker_queue")
+        self.assertIsNone(normalized["payload"]["entries"][0]["volume"])
+        self.assertIsNone(normalized["payload"]["entries"][1]["volume"])
 
     def test_broker_queue_reindexes_duplicate_positions_with_stable_unique_ids(self) -> None:
         rows = [
@@ -1113,6 +1280,39 @@ def raw_tick(seq: int, source_ts: str, price: float, volume: int) -> dict:
             "side": "buy",
             "broker_code": "JPM",
         },
+    )
+
+
+def canonical_trade_tick(
+    seq: int,
+    source_ts: str,
+    price: float,
+    volume: int,
+    *,
+    side: str = "buy",
+    broker_code: str = "JPM",
+    **payload_overrides,
+) -> dict:
+    payload = {
+        "source_kind": "canonical_trade_tick",
+        "source_table": "trade_ticks",
+        "source_event_id": f"source-event-{seq}",
+        "trade_id": f"trade-{seq}",
+        "price": price,
+        "volume": volume,
+        "turnover": price * volume,
+        "side": side,
+        "broker_code": broker_code,
+        **payload_overrides,
+    }
+    return make_raw_market_event(
+        kind="tick",
+        symbol="00700.HK",
+        source="xtquant",
+        period="trade_tick",
+        seq=seq,
+        source_ts=source_ts,
+        payload=payload,
     )
 
 

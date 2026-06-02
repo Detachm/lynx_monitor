@@ -508,10 +508,14 @@ class AppRuntimeTest(unittest.TestCase):
                     kind="tick",
                     symbol="00700.HK",
                     source="xtquant",
-                    period="hktransaction",
+                    period="trade_tick",
                     seq=1,
                     source_ts="2026-05-22T09:32:00+08:00",
                     payload={
+                        "source_kind": "canonical_trade_tick",
+                        "source_table": "trade_ticks",
+                        "source_event_id": "trade-hot-cache-1",
+                        "trade_id": "trade-hot-cache-1",
                         "price": 389.2,
                         "volume": 1000,
                         "turnover": 389200,
@@ -882,7 +886,7 @@ class AppRuntimeTest(unittest.TestCase):
         self.assertEqual(rows[0]["reason"], "Kafka event key must match event symbol")
         self.assertEqual(rows[0]["value"]["symbol"], "00700.HK")
 
-    def test_supervisor_tick_drains_small_hktransaction_into_throttled_latest_bar(self) -> None:
+    def test_supervisor_tick_drains_small_hktransaction_without_chart_bar_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_silver(root)
@@ -955,7 +959,9 @@ class AppRuntimeTest(unittest.TestCase):
             self.assertTrue(runtime_state_record["realtime_attached"])
             self.assertEqual(runtime_state_record["requested_trade_date"], "20260522")
             self.assertEqual(snapshot["snapshot"]["price"], 388.4)
-            self.assertEqual(snapshot["minute_bars"][0]["volume"], 2000)
+            self.assertEqual(snapshot["snapshot"]["volume"], 3000)
+            self.assertEqual(snapshot["minute_bars"][0]["volume"], 1000)
+            self.assertFalse(snapshot["last_tick"]["chart_update"])
             self.assertEqual(snapshot["alerts"], [])
             self.assertEqual(runtime.octopus.health.latest_event_at_by_symbol["00700.HK"], "2026-05-22T09:30:00+08:00")
             symbol_runtime_payload = runtime.symbol_runtime_manager.runtimes["00700.HK"].snapshot_payload
@@ -1171,6 +1177,8 @@ class AppRuntimeTest(unittest.TestCase):
 
         self.assertEqual(snapshot["schema_version"], 1)
         self.assertEqual(persisted["generated_at"], "2026-05-22T09:30:02+08:00")
+        self.assertIsInstance(persisted["runtime_epoch"], str)
+        self.assertTrue(persisted["runtime_epoch"])
         self.assertIsInstance(persisted["supervisor"]["started_at"], str)
         self.assertEqual(persisted["supervisor"]["last_tick_at"], "2026-05-22T09:30:01+08:00")
         self.assertIsNone(persisted["supervisor"]["stopped_at"])
@@ -1213,6 +1221,10 @@ class AppRuntimeTest(unittest.TestCase):
         self.assertTrue(persisted["symbol_runtime"]["00700.HK"]["realtime_attached"])
         self.assertEqual(persisted["redis_snapshot"]["checked_symbols"], ["00700.HK"])
         self.assertEqual(persisted["redis_snapshot"]["present_symbols"], ["00700.HK"])
+        self.assertEqual(persisted["trade_tick_replay_count"], 0)
+        self.assertEqual(persisted["alert_count_by_symbol"], {"00700.HK": 0})
+        self.assertFalse(persisted["trade_tick_source_available"])
+        self.assertFalse(persisted["realtime_recovery"]["trade_tick_source_available_by_symbol"]["00700.HK"])
         self.assertEqual(persisted["redis_snapshot"]["missing_symbols"], [])
         self.assertEqual(
             persisted["redis_snapshot"]["required_key_families"],
