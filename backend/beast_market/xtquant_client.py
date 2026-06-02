@@ -5,6 +5,7 @@ import inspect
 import os
 import sys
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import time
 from typing import Any, Callable, Iterable
@@ -13,7 +14,7 @@ from .runtime import normalize_subscription_symbol
 
 
 CallbackSink = Callable[[dict[str, Any]], bool | None]
-DEFAULT_XTQUANT_PERIODS = ("hktransaction", "hkbrokerqueueex")
+DEFAULT_XTQUANT_PERIODS = ("1m", "hktransaction", "hkbrokerqueueex")
 DEFAULT_XTQUANT_DATA_HOME = Path("/home/hliu/xtbackend/.runtime/xtquant")
 DEFAULT_XTQUANT_CONFIG = Path("/home/hliu/beast/services/mammoth/historical-ingestion-service/config/bronze_ingest_routine.yaml")
 DEFAULT_XTQUANT_ALLOW_OPTIMIZE_ADDRESSES = (
@@ -164,6 +165,37 @@ class XtQuantMarketDataClient:
                 continue
             ticks[symbol] = value
         return ticks
+
+    def get_minute_bars(self, raw_symbol: str, trade_date: str) -> list[dict[str, Any]]:
+        """Fetch today's native xtquant 1m bars for startup/cold hydration backfill."""
+
+        module = self._xtdata()
+        symbol = normalize_subscription_symbol(raw_symbol)
+        download = getattr(module, "download_history_data", None)
+        if callable(download):
+            try:
+                download(symbol, "1m", start_time=trade_date, end_time=trade_date)
+            except Exception:
+                pass
+        get_market_data_ex = getattr(module, "get_market_data_ex", None)
+        if not callable(get_market_data_ex):
+            return []
+        try:
+            data = get_market_data_ex(
+                [],
+                [symbol],
+                "1m",
+                start_time=trade_date,
+                end_time=trade_date,
+                count=-1,
+                fill_data=False,
+            )
+        except Exception:
+            return []
+        frame = data.get(symbol) if isinstance(data, dict) else None
+        records = frame_records(frame)
+        bars = [normalize_xtquant_1m_record(record, trade_date) for record in records]
+        return [bar for bar in bars if bar is not None]
 
     def unsubscribe(self, raw_symbol: str) -> None:
         symbol = normalize_subscription_symbol(raw_symbol)
@@ -408,3 +440,78 @@ def callback_data_items(raw_payload: Any, symbol: str) -> list[dict[str, Any]]:
         if isinstance(value, dict):
             return [value]
     return [raw_payload]
+
+
+HK_TZ = timezone(timedelta(hours=8))
+
+
+def frame_records(frame: Any) -> list[dict[str, Any]]:
+    if frame is None:
+        return []
+    candidate = frame
+    reset_index = getattr(candidate, "reset_index", None)
+    if callable(reset_index):
+        try:
+            candidate = reset_index()
+        except Exception:
+            candidate = frame
+    to_dict = getattr(candidate, "to_dict", None)
+    if callable(to_dict):
+        try:
+            records = to_dict("records")
+        except TypeError:
+            records = to_dict()
+        if isinstance(records, list):
+            return [record for record in records if isinstance(record, dict)]
+    if isinstance(candidate, list):
+        return [record for record in candidate if isinstance(record, dict)]
+    return []
+
+
+def normalize_xtquant_1m_record(record: dict[str, Any], trade_date: str) -> dict[str, Any] | None:
+    close = first_numeric(record, "close", "Close", "price", "Price", "lastPrice", "last_price")
+    if close is None or close <= 0:
+        return None
+    timestamp = minute_record_timestamp(record, trade_date)
+    volume = first_numeric(record, "volume", "Volume", "qty", "quantity")
+    turnover = first_numeric(record, "amount", "Amount", "turnover", "Turnover")
+    return {
+        "timestamp": timestamp,
+        "open": first_numeric(record, "open", "Open") or close,
+        "high": first_numeric(record, "high", "High") or close,
+        "low": first_numeric(record, "low", "Low") or close,
+        "close": close,
+        "price": close,
+        "volume": int(volume or 0),
+        "turnover": float(turnover or 0.0),
+    }
+
+
+def minute_record_timestamp(record: dict[str, Any], trade_date: str) -> str:
+    for key in ("bar_ts", "timestamp", "Timestamp", "datetime", "Datetime"):
+        value = record.get(key)
+        if isinstance(value, str) and "T" in value:
+            return value
+    time_value = record.get("time")
+    numeric_time = first_numeric(record, "time", "Time")
+    if numeric_time and numeric_time > 10_000_000_000:
+        return datetime.fromtimestamp(numeric_time / 1000, tz=timezone.utc).astimezone(HK_TZ).isoformat(timespec="milliseconds")
+    index_value = str(record.get("index") or record.get("Index") or "")
+    if len(index_value) >= 12 and index_value[:12].isdigit():
+        return datetime.strptime(index_value[:12], "%Y%m%d%H%M").replace(tzinfo=HK_TZ).isoformat(timespec="milliseconds")
+    time_text = str(time_value or record.get("Time") or "").replace(":", "")
+    if len(time_text) >= 4 and time_text[:4].isdigit():
+        return datetime.strptime(f"{trade_date}{time_text[:4]}", "%Y%m%d%H%M").replace(tzinfo=HK_TZ).isoformat(timespec="milliseconds")
+    return datetime.now(timezone.utc).astimezone(HK_TZ).isoformat(timespec="milliseconds")
+
+
+def first_numeric(data: dict[str, Any], *keys: str) -> float | None:
+    for key in keys:
+        value = data.get(key)
+        if value in (None, ""):
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return None

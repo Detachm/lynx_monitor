@@ -99,6 +99,7 @@ export interface PriceTick {
   volume: number
   turnover: number
   direction: 'up' | 'down' | 'flat'
+  replace?: boolean
 }
 
 export interface BigTradeAlert {

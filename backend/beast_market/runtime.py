@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from time import monotonic, perf_counter
 from typing import Any, Callable, Protocol
 
@@ -21,6 +21,7 @@ StateProvider = Callable[[str], dict[str, Any] | None]
 RuntimeRawEventProcessor = Callable[[dict[str, Any], str], tuple[list[dict[str, Any]], list[dict[str, Any]]]]
 RawDeadLetterSink = Callable[[DeadLetterRecord], None]
 MAX_CALLBACK_LATENCY_SAMPLES = 500
+HK_TZ = timezone(timedelta(hours=8))
 
 
 @dataclass
@@ -405,6 +406,16 @@ def normalize_xtquant_callback(payload: dict[str, Any]) -> dict[str, Any]:
     if not period:
         period = infer_period(data)
 
+    if period in {"1m", "1min", "minute", "minute_bar", "minute_bars"}:
+        minute_payload = normalize_legacy_minute_bar(data)
+        return {
+            "kind": "tick",
+            "symbol": symbol,
+            "period": "1m",
+            "source_ts": minute_payload.pop("timestamp"),
+            "payload": minute_payload,
+        }
+
     if period in {"hktransaction", "trade_tick", "tick"}:
         tick_payload = normalize_legacy_tick(data)
         return {
@@ -436,6 +447,44 @@ def normalize_xtquant_callback(payload: dict[str, Any]) -> dict[str, Any]:
         }
 
     raise ValueError(f"unsupported callback period: {period}")
+
+
+def normalize_legacy_minute_bar(data: dict[str, Any]) -> dict[str, Any]:
+    close = first_present(data, "Close", "close", "Price", "price", "lastPrice", "last_price")
+    if close is None:
+        raise ValueError("missing minute close")
+    close_value = float(close)
+    volume = first_present(data, "Volume", "volume", "qty", "quantity")
+    turnover = first_present(data, "Turnover", "turnover", "Amount", "amount")
+    timestamp = normalize_minute_bar_timestamp(data)
+    return {
+        "timestamp": timestamp,
+        "price": close_value,
+        "open": float(first_present(data, "Open", "open") or close_value),
+        "high": float(first_present(data, "High", "high") or close_value),
+        "low": float(first_present(data, "Low", "low") or close_value),
+        "close": close_value,
+        "volume": int(float(volume or 0)),
+        "turnover": float(turnover or 0.0),
+    }
+
+
+def normalize_minute_bar_timestamp(data: dict[str, Any]) -> str:
+    explicit = first_present(data, "bar_ts", "timestamp", "Timestamp", "datetime", "Datetime")
+    if isinstance(explicit, str) and "T" in explicit:
+        return explicit
+    try:
+        explicit_numeric = float(explicit) if explicit not in (None, "") else 0
+    except (TypeError, ValueError):
+        explicit_numeric = 0
+    if explicit_numeric > 10_000_000_000:
+        return datetime.fromtimestamp(explicit_numeric / 1000, tz=timezone.utc).astimezone(HK_TZ).isoformat(timespec="milliseconds")
+    index_value = first_present(data, "index", "Index")
+    index_text = str(index_value or "")
+    if len(index_text) >= 12 and index_text[:12].isdigit():
+        parsed = datetime.strptime(index_text[:12], "%Y%m%d%H%M").replace(tzinfo=HK_TZ)
+        return parsed.isoformat(timespec="milliseconds")
+    return normalize_source_timestamp(first_present(data, "time", "Time", "_Collect_time", "_collect_time"))
 
 
 def normalize_legacy_tick(data: dict[str, Any]) -> dict[str, Any]:
@@ -581,6 +630,8 @@ def first_present(data: dict[str, Any], *keys: str) -> Any:
 
 
 def infer_period(data: dict[str, Any]) -> str:
+    if any(key in data for key in ("Open", "open", "High", "high", "Low", "low", "Close", "close")):
+        return "1m"
     if any(key in data for key in ("AskQueues", "askQueues", "BidQueues", "bidQueues")):
         return "hkbrokerqueueex"
     if any(key in data for key in ("AskPrice", "askPrice", "BidPrice", "bidPrice")):

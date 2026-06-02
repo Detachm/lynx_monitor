@@ -504,6 +504,8 @@ def build_real_data_runtime(
     port: int,
     path: str,
     big_trade_volume_baseline_ratio: float,
+    big_trade_min_volume_threshold: int = 5_000,
+    big_trade_turnover_threshold: float = 1_000_000.0,
     min_chart_minute_bars: int = DEFAULT_MIN_CHART_MINUTE_BARS,
 ) -> tuple[MammothAPI, InMemoryEventBus, InMemoryRedisSnapshotCache, GatewayV2WebSocketService]:
     mammoth = MammothAPI(reader=reader)
@@ -514,6 +516,8 @@ def build_real_data_runtime(
         bus,
         cache,
         big_trade_volume_baseline_ratio=big_trade_volume_baseline_ratio,
+        big_trade_min_volume_threshold=big_trade_min_volume_threshold,
+        big_trade_turnover_threshold=big_trade_turnover_threshold,
     )
     results = bootstrap_snapshots(
         mammoth=mammoth,
@@ -1205,6 +1209,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="L2 silver patch root. Can be passed multiple times.",
     )
     parser.add_argument("--big-trade-volume-baseline-ratio", type=positive_float, default=0.0005)
+    parser.add_argument("--big-trade-min-volume-threshold", type=positive_int, default=5_000)
+    parser.add_argument("--big-trade-turnover-threshold", type=positive_float, default=1_000_000.0)
     parser.add_argument(
         "--min-chart-minute-bars",
         type=positive_int,
@@ -1270,6 +1276,8 @@ def main(argv: list[str] | None = None) -> None:
         port=args.port,
         path=args.path,
         big_trade_volume_baseline_ratio=args.big_trade_volume_baseline_ratio,
+        big_trade_min_volume_threshold=args.big_trade_min_volume_threshold,
+        big_trade_turnover_threshold=args.big_trade_turnover_threshold,
         min_chart_minute_bars=args.min_chart_minute_bars,
     )
     asyncio.run(

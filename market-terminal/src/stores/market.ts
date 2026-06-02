@@ -473,6 +473,19 @@ function upsertMinuteTick(existing: PriceTick[], tick: PriceTick): PriceTick[] {
   }
 
   const previous = existing[index]!
+  if (tick.replace) {
+    return [
+      ...existing.slice(0, index),
+      {
+        ...previous,
+        ...tick,
+        timestamp: minuteTimestamp,
+      },
+      ...existing.slice(index + 1),
+    ]
+      .sort((left, right) => minuteBucket(left.timestamp).localeCompare(minuteBucket(right.timestamp)))
+      .slice(-MAX_TICKS_PER_SYMBOL)
+  }
   const updated = [
     ...existing.slice(0, index),
     {

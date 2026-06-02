@@ -26,7 +26,15 @@ from .contracts import (
 from .freshness import FreshnessPolicy
 from .gateway_transport import GatewayV2SessionManager
 from .mammoth_api import DuckDBParquetSilverTableReader, MammothAPI
-from .pipeline import GatewayV2, OctopusComputeV2, RealtimeCollectorV2, minute_bucket, rollover_realtime_session, snapshot_trade_date
+from .pipeline import (
+    GatewayV2,
+    OctopusComputeV2,
+    RealtimeCollectorV2,
+    minute_bucket,
+    prune_future_minute_bars,
+    rollover_realtime_session,
+    snapshot_trade_date,
+)
 from .production_adapters import (
     KafkaAdapterConfig,
     KafkaEventBusAdapter,
@@ -82,6 +90,8 @@ class BeastMarketRuntimeConfig:
     persist_realtime_events: bool = True
     commit_runtime_owned_raw_offsets: bool = True
     big_trade_volume_baseline_ratio: float = 0.0005
+    big_trade_min_volume_threshold: int = 5_000
+    big_trade_turnover_threshold: float = 1_000_000.0
     hydrate_historical_alerts: bool = False
     active_pool: ActivePoolConfig = field(default_factory=ActivePoolConfig)
     freshness_policy: FreshnessPolicy = FreshnessPolicy()
@@ -217,6 +227,7 @@ class BeastMarketRuntimeSupervisor:
                         hydrate_participant_history=True,
                     )
                     self.runtime.octopus.set_state(symbol, cached_snapshot)
+                    self.runtime.octopus._cache_set_terminal_snapshot(self.runtime.config.trade_date, symbol, cached_snapshot)
                 else:
                     self.runtime.octopus.preload_bod(
                         symbol,
@@ -247,7 +258,7 @@ class BeastMarketRuntimeSupervisor:
                 for symbol in symbol_list:
                     if should_attach_realtime_for_symbol(self.runtime, symbol):
                         self.runtime.symbol_runtime_manager.activate_symbol(symbol, strict_realtime=True)
-                        seed_symbol_from_market_full_tick(self.runtime, symbol)
+                        seed_symbol_from_market_realtime(self.runtime, symbol)
             self.running = True
             self.stats.starts += 1
             self.stats.started_at = now_iso()
@@ -339,6 +350,11 @@ class BeastMarketRuntimeSupervisor:
         self.stats.processed_events += len(processed)
         self.stats.broadcast_messages += direct_terminal_enqueued + broadcast
         self.stats.last_tick_at = now or now_iso()
+        terminal_messages = (
+            list(direct_terminal_messages)
+            if runtime_owned_raw_path
+            else [*direct_terminal_messages, *self.runtime.gateway.last_terminal_messages]
+        )
         return {
             "ingested_events": len(ingested),
             "processed_events": len(processed),
@@ -351,7 +367,7 @@ class BeastMarketRuntimeSupervisor:
             "evicted_symbols": evicted_symbols,
             "raw_events": ingested,
             "processed_event_payloads": processed,
-            "terminal_messages": [*direct_terminal_messages, *self.runtime.gateway.last_terminal_messages],
+            "terminal_messages": terminal_messages,
         }
 
     def health_snapshot(self, *, generated_at: str | None = None) -> dict[str, Any]:
@@ -600,6 +616,8 @@ def build_beast_market_runtime(
         event_bus,
         cache,
         big_trade_volume_baseline_ratio=config.big_trade_volume_baseline_ratio,
+        big_trade_min_volume_threshold=config.big_trade_min_volume_threshold,
+        big_trade_turnover_threshold=config.big_trade_turnover_threshold,
         hydrate_historical_alerts=config.hydrate_historical_alerts,
     )
     raw_consumer_worker = RawEventConsumerWorker(
@@ -686,7 +704,7 @@ def build_beast_market_runtime(
         should_attach=lambda symbol: should_attach_realtime_for_symbol(runtime, symbol),
     )
     symbol_runtime_manager.hydrate_symbol = lambda symbol: hydrate_symbol_snapshot(runtime, symbol)
-    session_manager.realtime_seed_provider = lambda symbol: seed_symbol_from_market_full_tick(runtime, symbol)
+    session_manager.realtime_seed_provider = lambda symbol: seed_symbol_from_market_realtime(runtime, symbol)
     return runtime
 
 
@@ -911,6 +929,38 @@ def seed_symbol_from_market_full_tick(runtime: BeastMarketRuntime, symbol: str) 
     return processed
 
 
+def seed_symbol_from_market_realtime(runtime: BeastMarketRuntime, symbol: str) -> list[dict[str, Any]]:
+    processed = []
+    processed.extend(backfill_symbol_from_market_minute_bars(runtime, symbol))
+    processed.extend(seed_symbol_from_market_full_tick(runtime, symbol))
+    return processed
+
+
+def backfill_symbol_from_market_minute_bars(runtime: BeastMarketRuntime, symbol: str) -> list[dict[str, Any]]:
+    if runtime.subscription_manager is None:
+        return []
+    get_minute_bars = getattr(runtime.subscription_manager.client, "get_minute_bars", None)
+    if not callable(get_minute_bars):
+        return []
+    try:
+        bars = get_minute_bars(symbol, runtime.config.trade_date)
+    except Exception:
+        return []
+    if not bars:
+        return []
+    try:
+        processed = runtime.octopus.process_minute_bar_backfill(symbol, bars, runtime.config.trade_date)
+    except Exception:
+        return []
+    for event in processed:
+        runtime.runtime_state.append_processed_event(runtime.config.trade_date, symbol, event)
+    runtime.symbol_runtime_manager.apply_processed_events(processed)
+    state = runtime.octopus.get_state(symbol)
+    if isinstance(state, dict):
+        runtime.symbol_runtime_manager.seed_snapshot(symbol, state)
+    return processed
+
+
 def first_numeric(data: dict[str, Any], *keys: str) -> float | None:
     for key in keys:
         value = data.get(key)
@@ -949,6 +999,12 @@ def startup_cached_snapshot(runtime: BeastMarketRuntime, symbol: str) -> dict[st
     try:
         snapshot = runtime.cache.get_terminal_snapshot(runtime.config.trade_date, symbol)
         runtime.startup_cache_read_errors_by_symbol.pop(symbol, None)
+        if isinstance(snapshot, dict):
+            normalize_snapshot_minute_bars(snapshot)
+            try:
+                runtime.cache.set_terminal_snapshot(runtime.config.trade_date, symbol, snapshot)
+            except Exception as error:
+                runtime.startup_cache_read_errors_by_symbol[symbol] = f"redis_terminal_snapshot_write_failed: {error}"
         return snapshot
     except Exception as error:
         runtime.octopus.health.process = "degraded"
@@ -996,9 +1052,14 @@ def hydrate_symbol_snapshot(runtime: BeastMarketRuntime, symbol: str) -> dict[st
         effective_trade_date=effective_trade_date,
     ):
         normalize_snapshot_minute_bars(cached)
+        try:
+            runtime.cache.set_terminal_snapshot(requested_trade_date, symbol, cached)
+        except Exception as error:
+            mark_snapshot_degraded(cached, f"redis_terminal_snapshot_write_failed: {error}")
         apply_symbol_display_name(runtime, symbol, cached)
         runtime.octopus.ensure_bod_context(symbol, effective_trade_date, hydrate_participant_history=True)
         runtime.octopus.set_state(symbol, cached)
+        runtime.octopus._cache_set_terminal_snapshot(requested_trade_date, symbol, cached)
         return cached
     snapshot = runtime.octopus.preload_bod(
         symbol,
@@ -1009,7 +1070,7 @@ def hydrate_symbol_snapshot(runtime: BeastMarketRuntime, symbol: str) -> dict[st
     apply_symbol_display_name(runtime, symbol, snapshot)
     if should_attach_realtime_for_symbol(runtime, symbol):
         promote_snapshot_to_realtime_session(runtime, symbol, snapshot)
-        seed_symbol_from_market_full_tick(runtime, symbol)
+        seed_symbol_from_market_realtime(runtime, symbol)
         seeded_snapshot = runtime.octopus.get_state(symbol)
         if isinstance(seeded_snapshot, dict):
             snapshot = seeded_snapshot
@@ -1099,6 +1160,8 @@ def process_recovery_raw_event(
     request_trade_date: str,
 ) -> list[dict[str, Any]]:
     if raw_event.get("kind") == "tick":
+        if str(raw_event.get("period") or "").strip().lower() in {"1m", "1min", "minute", "minute_bar", "minute_bars"}:
+            return runtime.octopus.process_raw_event(raw_event, request_trade_date)
         return runtime.octopus.process_historical_alert_event(raw_event, request_trade_date)
     return runtime.octopus.process_raw_event(raw_event, request_trade_date)
 
@@ -1190,7 +1253,10 @@ def normalize_snapshot_minute_bars(snapshot: dict[str, Any]) -> None:
         timestamp = str(raw_bar.get("timestamp") or "")
         if not timestamp:
             continue
-        bucket = minute_bucket(timestamp)
+        try:
+            bucket = minute_bucket(timestamp)
+        except ValueError:
+            continue
         if not is_regular_hk_trading_minute(bucket, trade_date):
             continue
         bar = dict(raw_bar)
@@ -1206,7 +1272,7 @@ def normalize_snapshot_minute_bars(snapshot: dict[str, Any]) -> None:
         previous["volume"] = int(previous.get("volume") or 0) + int(bar.get("volume") or 0)
         previous["turnover"] = float(previous.get("turnover") or 0) + float(bar.get("turnover") or 0)
         previous["direction"] = bar.get("direction", previous.get("direction", "flat"))
-    snapshot["minute_bars"] = [merged_by_minute[key] for key in sorted(merged_by_minute)]
+    snapshot["minute_bars"] = prune_future_minute_bars([merged_by_minute[key] for key in sorted(merged_by_minute)])
 
 
 def snapshot_trade_date(snapshot: dict[str, Any]) -> str:
@@ -1349,6 +1415,8 @@ def runtime_config_from_artifact(config: dict[str, Any]) -> BeastMarketRuntimeCo
         persist_realtime_events=bool_value(runtime.get("persist_realtime_events"), default=True),
         commit_runtime_owned_raw_offsets=bool_value(runtime.get("commit_runtime_owned_raw_offsets"), default=True),
         big_trade_volume_baseline_ratio=float_value(runtime.get("big_trade_volume_baseline_ratio"), default=0.0005),
+        big_trade_min_volume_threshold=int_value(runtime.get("big_trade_min_volume_threshold"), default=5_000),
+        big_trade_turnover_threshold=float_value(runtime.get("big_trade_turnover_threshold"), default=1_000_000.0),
         active_pool=ActivePoolConfig(
             target_size=int_value(active_pool.get("target_size"), default=200),
             pinned_max_size=int_value(active_pool.get("pinned_max_size"), default=100),
@@ -1450,8 +1518,10 @@ def evaluate_runtime_config_artifact(config: dict[str, Any]) -> dict[str, Any]:
         blockers.append("runtime_config_symbol_eviction_grace_invalid")
     if not positive_number(runtime.get("big_trade_volume_baseline_ratio")):
         blockers.append("runtime_config_big_trade_volume_ratio_invalid")
-    if "big_trade_turnover_threshold" in runtime:
-        blockers.append("runtime_config_big_trade_turnover_threshold_deprecated")
+    if "big_trade_min_volume_threshold" in runtime and not positive_integer(runtime.get("big_trade_min_volume_threshold")):
+        blockers.append("runtime_config_big_trade_min_volume_threshold_invalid")
+    if "big_trade_turnover_threshold" in runtime and not positive_number(runtime.get("big_trade_turnover_threshold")):
+        blockers.append("runtime_config_big_trade_turnover_threshold_invalid")
     if active_pool:
         if not positive_integer(active_pool.get("target_size")):
             blockers.append("runtime_config_active_pool_target_size_invalid")
@@ -1510,6 +1580,8 @@ def evaluate_runtime_config_artifact(config: dict[str, Any]) -> dict[str, Any]:
             "persist_realtime_events": runtime.get("persist_realtime_events"),
             "commit_runtime_owned_raw_offsets": runtime.get("commit_runtime_owned_raw_offsets"),
             "big_trade_volume_baseline_ratio": runtime.get("big_trade_volume_baseline_ratio"),
+            "big_trade_min_volume_threshold": runtime.get("big_trade_min_volume_threshold"),
+            "big_trade_turnover_threshold": runtime.get("big_trade_turnover_threshold"),
             "install_signal_handlers": runtime.get("install_signal_handlers"),
         },
         "active_pool": {
@@ -1603,6 +1675,7 @@ def history_provider(mammoth: MammothAPI, trade_date: str):
         participant_id = participant_id_for_name(mammoth, symbol, participant_name, trade_date)
         if not participant_id:
             return []
+        requested_days = max(1, min(int(days or 7), 7))
         return [
             {
                 "date": str(row["trade_date"]),
@@ -1611,7 +1684,7 @@ def history_provider(mammoth: MammothAPI, trade_date: str):
                 "change": int(row.get("change") or 0),
             }
             for row in participant_history_with_computed_change(
-                mammoth.get_participant_history(symbol, participant_id, 2, trade_date=trade_date)
+                mammoth.get_participant_history(symbol, participant_id, requested_days, trade_date=trade_date)
             )
         ]
 

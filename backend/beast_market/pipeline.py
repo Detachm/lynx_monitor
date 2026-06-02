@@ -22,6 +22,7 @@ from .mammoth_api import MammothAPI
 from .trading_session import is_regular_hk_trading_minute
 
 HK_TZ = timezone(timedelta(hours=8))
+LATEST_BAR_WRITE_INTERVAL_SECONDS = 1.0
 
 
 @dataclass
@@ -212,27 +213,61 @@ class OctopusComputeV2:
         cache: SnapshotCache,
         *,
         big_trade_volume_baseline_ratio: float = 0.0005,
+        big_trade_min_volume_threshold: int = 5_000,
+        big_trade_turnover_threshold: float = 1_000_000.0,
         hydrate_historical_alerts: bool = False,
     ) -> None:
         self.mammoth = mammoth
         self.bus = bus
         self.cache = cache
         self.big_trade_volume_baseline_ratio = big_trade_volume_baseline_ratio
+        self.big_trade_min_volume_threshold = big_trade_min_volume_threshold
+        self.big_trade_turnover_threshold = big_trade_turnover_threshold
         self.hydrate_historical_alerts = hydrate_historical_alerts
         self.seq_by_symbol: dict[str, int] = defaultdict(int)
         self.state_by_symbol: dict[str, dict[str, Any]] = {}
         self.bod_by_symbol: dict[str, BodState] = {}
+        self.latest_bar_flush_at_by_symbol: dict[str, float] = {}
+        self.latest_bar_flushed_minute_by_symbol: dict[str, str] = {}
         self.health = HealthStatus(process="running", kafka="connected", redis="connected", kafka_lag=0)
 
     def get_state(self, symbol: str) -> dict[str, Any] | None:
         return self.state_by_symbol.get(symbol)
 
     def set_state(self, symbol: str, state: dict[str, Any]) -> dict[str, Any]:
+        self.filter_state_alerts_for_policy(symbol, state)
         self.state_by_symbol[symbol] = state
         return state
 
     def has_state(self, symbol: str) -> bool:
         return symbol in self.state_by_symbol
+
+    def is_big_trade(self, tick: dict[str, Any], bod: BodState | None) -> bool:
+        return is_big_trade(
+            tick,
+            bod,
+            volume_baseline_ratio=self.big_trade_volume_baseline_ratio,
+            min_volume_threshold=self.big_trade_min_volume_threshold,
+            turnover_threshold=self.big_trade_turnover_threshold,
+        )
+
+    def filter_state_alerts_for_policy(self, symbol: str, state: dict[str, Any]) -> None:
+        alerts = state.get("alerts")
+        if not isinstance(alerts, list):
+            return
+        bod = self.bod_by_symbol.get(symbol)
+        filtered: list[dict[str, Any]] = []
+        for alert in alerts:
+            if not isinstance(alert, dict):
+                continue
+            tick = {
+                "price": float(alert.get("price") or 0),
+                "volume": int(alert.get("volume") or 0),
+                "turnover": float(alert.get("turnover") or 0),
+            }
+            if self.is_big_trade(tick, bod):
+                filtered.append(alert)
+        state["alerts"] = filtered[:500]
 
     def preload_symbols(self, symbols: list[str], trade_date: str) -> dict[str, dict[str, Any]]:
         return {symbol: self.preload_bod(symbol, trade_date) for symbol in symbols}
@@ -351,7 +386,7 @@ class OctopusComputeV2:
                 "turnover": float(row.get("turnover") or 0),
                 "direction": "flat",
             }
-            if not is_big_trade(tick, bod, self.big_trade_volume_baseline_ratio):
+            if not self.is_big_trade(tick, bod):
                 continue
             payload = {
                 "side": row.get("side"),
@@ -412,14 +447,14 @@ class OctopusComputeV2:
         if hydrate_participant_history:
             participant_history_by_id = {
                 holding["participantCode"]: participant_history_points(
-                    self.mammoth.get_participant_history(symbol, holding["participantCode"], 2, trade_date=trade_date)
+                    self.mammoth.get_participant_history(symbol, holding["participantCode"], 7, trade_date=trade_date)
                 )
                 for holding in holdings
             }
             for participant_id, history in participant_history_by_id.items():
                 self._cache_set_holding_history(symbol, participant_id, history)
         self.bod_by_symbol[symbol] = BodState(
-            volume_baseline=volume_baseline(daily_bars),
+            volume_baseline=volume_baseline(daily_bars, trade_date),
             broker_mapping_by_code=broker_mapping_by_code,
             highlighted_participants=highlighted_participants,
             participant_history_by_id=participant_history_by_id,
@@ -484,6 +519,9 @@ class OctopusComputeV2:
         if raw_event["kind"] != "tick":
             return []
 
+        if is_minute_bar_source(raw_event):
+            return self.process_minute_bar_event(raw_event, trade_date, state)
+
         if is_trade_tick_alert_source(raw_event):
             return self.process_trade_tick_alert_event(raw_event, trade_date, state)
 
@@ -528,9 +566,17 @@ class OctopusComputeV2:
         self.health.kafka_lag = self.bus.lag(RAW_TOPIC, committed_offset=self.seq_by_symbol[symbol])
         return processed_events
 
-    def apply_tick_to_state(self, state: dict[str, Any], raw_event: dict[str, Any], trade_date: str) -> TickStateUpdate:
+    def apply_tick_to_state(
+        self,
+        state: dict[str, Any],
+        raw_event: dict[str, Any],
+        trade_date: str,
+        *,
+        minute_freshness_key: str = "minute_bars",
+    ) -> TickStateUpdate:
         symbol = raw_event["symbol"]
         payload = raw_event["payload"]
+        state["minute_bars"] = prune_future_minute_bars(state.get("minute_bars", []))
         tick = {
             "timestamp": raw_event["source_ts"],
             "price": float(payload["price"]),
@@ -575,19 +621,130 @@ class OctopusComputeV2:
         }
         previous_close = float(state["snapshot"]["previousClose"])
         state["snapshot"]["changePercent"] = 0.0 if previous_close == 0 else state["snapshot"]["change"] / previous_close * 100
-        updates_chart = is_regular_hk_trading_minute(tick["timestamp"], trade_date)
+        updates_chart = (not is_full_tick_seed) and is_regular_hk_trading_minute(tick["timestamp"], trade_date)
         if updates_chart:
-            minute_tick = {**tick, "volume": 0, "turnover": 0.0} if is_full_tick_seed else tick
-            state["minute_bars"] = upsert_minute_bar(state["minute_bars"], minute_tick, trade_date)
+            state["minute_bars"] = upsert_minute_bar(state["minute_bars"], tick, trade_date)
         state["last_tick"] = tick
-        state["freshness"] = realtime_freshness(state, raw_event, trade_date, updates_minute_bars=updates_chart)
+        state["freshness"] = realtime_freshness(
+            state,
+            raw_event,
+            trade_date,
+            updates_minute_bars=updates_chart and minute_freshness_key == "minute_bars",
+            updates_latest_bar=updates_chart and minute_freshness_key == "latest_bar",
+        )
 
         alert = None
         bod = self.bod_by_symbol.get(symbol)
-        if not is_full_tick_seed and is_big_trade(tick, bod, self.big_trade_volume_baseline_ratio):
+        if not is_full_tick_seed and self.is_big_trade(tick, bod):
             alert = make_big_trade_alert(raw_event, tick, bod)
             state["alerts"] = [alert, *state["alerts"]][:500]
         return TickStateUpdate(state=state, tick=tick, alert=alert)
+
+    def process_minute_bar_event(
+        self,
+        raw_event: dict[str, Any],
+        trade_date: str,
+        state: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        symbol = raw_event["symbol"]
+        self.apply_minute_bar_to_state(state, raw_event, trade_date)
+        self.seq_by_symbol[symbol] += 1
+        self._cache_set_terminal_snapshot(trade_date, symbol, state)
+        event = make_processed_market_event(
+            result_type="snapshot",
+            symbol=symbol,
+            source="octopus",
+            seq=self.seq_by_symbol[symbol],
+            source_ts=raw_event["source_ts"],
+            payload=state,
+        )
+        self.bus.publish(PROCESSED_TOPIC, symbol, event)
+        self.health.latest_event_at_by_symbol[symbol] = raw_event["source_ts"]
+        self.health.kafka_lag = self.bus.lag(RAW_TOPIC, committed_offset=self.seq_by_symbol[symbol])
+        return [event]
+
+    def process_minute_bar_backfill(
+        self,
+        symbol: str,
+        bars: list[dict[str, Any]],
+        trade_date: str,
+        *,
+        source: str = "xtquant_1m_backfill",
+    ) -> list[dict[str, Any]]:
+        state = self.get_state(symbol)
+        if state is None:
+            raise RuntimeError(f"BOD state must be preloaded before minute backfill: {symbol}")
+        state["minute_bars"] = prune_future_minute_bars(state.get("minute_bars", []))
+        normalized = [
+            bar
+            for bar in (
+                minute_bar_from_payload({"source_ts": str(raw_bar.get("timestamp") or ""), "payload": raw_bar})
+                for raw_bar in bars
+            )
+            if bar is not None and not is_current_or_future_minute_bar(str(bar["timestamp"]))
+        ]
+        if not normalized:
+            return []
+        normalized.sort(key=lambda bar: minute_bucket(str(bar["timestamp"])))
+        latest_source_ts = str(normalized[-1]["timestamp"])
+        raw_event = {
+            "kind": "tick",
+            "symbol": symbol,
+            "source": source,
+            "period": "1m",
+            "source_ts": latest_source_ts,
+            "ingest_ts": now_iso(),
+            "payload": normalized[-1],
+            "event_id": f"raw-{source}-{symbol}-{safe_alert_id_part(latest_source_ts)}",
+            "seq": self.seq_by_symbol[symbol] + 1,
+        }
+        for bar in normalized:
+            self.apply_minute_bar_to_state(
+                state,
+                {**raw_event, "source_ts": str(bar["timestamp"]), "payload": bar},
+                trade_date,
+            )
+        self.seq_by_symbol[symbol] += 1
+        self._cache_set_terminal_snapshot(trade_date, symbol, state)
+        event = make_processed_market_event(
+            result_type="snapshot",
+            symbol=symbol,
+            source="octopus",
+            seq=self.seq_by_symbol[symbol],
+            source_ts=latest_source_ts,
+            payload=state,
+        )
+        self.bus.publish(PROCESSED_TOPIC, symbol, event)
+        self.health.latest_event_at_by_symbol[symbol] = latest_source_ts
+        self.health.kafka_lag = self.bus.lag(RAW_TOPIC, committed_offset=self.seq_by_symbol[symbol])
+        return [event]
+
+    def apply_minute_bar_to_state(
+        self,
+        state: dict[str, Any],
+        raw_event: dict[str, Any],
+        trade_date: str,
+    ) -> TickStateUpdate:
+        rollover_realtime_session(state, trade_date, raw_event["ingest_ts"])
+        state["minute_bars"] = prune_future_minute_bars(state.get("minute_bars", []))
+        bar = minute_bar_from_payload(raw_event)
+        if bar is None or is_current_or_future_minute_bar(str(bar["timestamp"])):
+            return TickStateUpdate(state=state, tick={})
+        previous_price = float(state["snapshot"].get("price") or bar["price"])
+        bar["direction"] = "up" if bar["price"] > previous_price else "down" if bar["price"] < previous_price else "flat"
+        bar["is_confirmed_minute_bar"] = True
+        bar["replace"] = True
+        state["minute_bars"] = upsert_confirmed_minute_bar(state.get("minute_bars", []), bar, trade_date)
+        update_snapshot_from_minute_bars(state, raw_event["ingest_ts"])
+        state["last_tick"] = bar
+        state["freshness"] = realtime_freshness(
+            state,
+            raw_event,
+            trade_date,
+            updates_minute_bars=True,
+            updates_latest_bar=False,
+        )
+        return TickStateUpdate(state=state, tick=bar)
 
     def process_historical_alert_event(self, raw_event: dict[str, Any], trade_date: str) -> list[dict[str, Any]]:
         """Generate alert state from historical ticks without rebuilding chart bars.
@@ -598,20 +755,14 @@ class OctopusComputeV2:
         symbol = raw_event["symbol"]
         if symbol not in self.state_by_symbol or raw_event["kind"] != "tick" or not is_trade_tick_alert_source(raw_event):
             return []
-        return self.process_trade_tick_alert_event(raw_event, trade_date, self.state_by_symbol[symbol])
+        return self.process_trade_tick_alert_only_event(raw_event, trade_date, self.state_by_symbol[symbol])
 
-    def process_trade_tick_alert_event(
+    def process_trade_tick_alert_only_event(
         self,
         raw_event: dict[str, Any],
         trade_date: str,
         state: dict[str, Any],
     ) -> list[dict[str, Any]]:
-        """Filter hktransaction ticks before mutating Redis-facing state.
-
-        Full-tick quote snapshots update price/minute state elsewhere. Transaction
-        ticks are high-volume alert candidates: non-big prints are consumed for
-        freshness only, while big prints update the alert read model.
-        """
         symbol = raw_event["symbol"]
         payload = raw_event["payload"]
         tick = {
@@ -622,18 +773,22 @@ class OctopusComputeV2:
             "direction": "flat",
         }
         bod = self.bod_by_symbol.get(symbol)
-        if not is_big_trade(tick, bod, self.big_trade_volume_baseline_ratio):
+        if not self.is_big_trade(tick, bod):
             self.health.latest_event_at_by_symbol[symbol] = raw_event["source_ts"]
             return []
 
         self.seq_by_symbol[symbol] += 1
         alert = make_big_trade_alert(raw_event, tick, bod)
         state["alerts"] = [alert, *state["alerts"]][:500]
+        freshness = dict(state.get("freshness") or {})
+        source_dates = dict(freshness.get("source_dates") or {})
+        source_dates["trade_ticks"] = trade_date
         state["freshness"] = {
-            **(state.get("freshness") or {}),
+            **freshness,
             "updated_at": raw_event["ingest_ts"],
             "source_ts": raw_event["source_ts"],
             "ingest_ts": raw_event["ingest_ts"],
+            "source_dates": source_dates,
         }
         alert_event = make_processed_market_event(
             result_type="big_trade_alert",
@@ -648,6 +803,66 @@ class OctopusComputeV2:
         self.health.latest_event_at_by_symbol[symbol] = raw_event["source_ts"]
         self.health.kafka_lag = self.bus.lag(RAW_TOPIC, committed_offset=self.seq_by_symbol[symbol])
         return [alert_event]
+
+    def process_trade_tick_alert_event(
+        self,
+        raw_event: dict[str, Any],
+        trade_date: str,
+        state: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """Aggregate hktransaction into the forming minute and persist only useful deltas."""
+        symbol = raw_event["symbol"]
+        update = self.apply_tick_to_state(state, raw_event, trade_date, minute_freshness_key="latest_bar")
+        tick = update.tick
+        alert = update.alert
+        publish_snapshot = self.should_publish_latest_bar(symbol, tick)
+        processed_events: list[dict[str, Any]] = []
+
+        if publish_snapshot:
+            self.seq_by_symbol[symbol] += 1
+            snapshot_event = make_processed_market_event(
+                result_type="snapshot",
+                symbol=symbol,
+                source="octopus",
+                seq=self.seq_by_symbol[symbol],
+                source_ts=raw_event["source_ts"],
+                payload=state,
+            )
+            self.bus.publish(PROCESSED_TOPIC, symbol, snapshot_event)
+            processed_events.append(snapshot_event)
+
+        if alert is not None:
+            self.seq_by_symbol[symbol] += 1
+            alert_event = make_processed_market_event(
+                result_type="big_trade_alert",
+                symbol=symbol,
+                source="octopus",
+                seq=self.seq_by_symbol[symbol],
+                source_ts=raw_event["source_ts"],
+                payload={"alert": alert, "freshness": state["freshness"]},
+            )
+            self.bus.publish(PROCESSED_TOPIC, symbol, alert_event)
+            processed_events.append(alert_event)
+
+        if processed_events:
+            self._cache_set_terminal_snapshot(trade_date, symbol, state)
+        self.health.latest_event_at_by_symbol[symbol] = raw_event["source_ts"]
+        self.health.kafka_lag = self.bus.lag(RAW_TOPIC, committed_offset=self.seq_by_symbol[symbol])
+        return processed_events
+
+    def should_publish_latest_bar(self, symbol: str, tick: dict[str, Any]) -> bool:
+        timestamp = str(tick.get("timestamp") or "")
+        if not timestamp:
+            return False
+        minute_ts = minute_bucket(timestamp)
+        previous_minute = self.latest_bar_flushed_minute_by_symbol.get(symbol)
+        now_value = iso_timestamp_seconds(timestamp)
+        previous_flush = self.latest_bar_flush_at_by_symbol.get(symbol)
+        if previous_minute != minute_ts or previous_flush is None or now_value - previous_flush >= LATEST_BAR_WRITE_INTERVAL_SECONDS:
+            self.latest_bar_flushed_minute_by_symbol[symbol] = minute_ts
+            self.latest_bar_flush_at_by_symbol[symbol] = now_value
+            return True
+        return False
 
     def _process_broker_queue(
         self,
@@ -892,7 +1107,7 @@ def participant_history_points(rows: list[dict[str, Any]]) -> list[dict[str, Any
             point["change"] = int(row["shares"]) - int(previous_row["shares"])
         points.append(point)
         previous_row = row
-    return points[-2:]
+    return points[-7:]
 
 
 def to_minute_bars(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -916,6 +1131,8 @@ def to_minute_bars(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "volume": int(row["volume"]),
                 "turnover": float(row["turnover"]),
                 "direction": direction,
+                "is_confirmed_minute_bar": True,
+                "replace": True,
             }
         )
         previous_close = close
@@ -966,14 +1183,26 @@ def is_big_trade(
     tick: dict[str, Any],
     bod: BodState | None,
     volume_baseline_ratio: float,
+    min_volume_threshold: int,
+    turnover_threshold: float,
 ) -> bool:
+    volume_candidates: list[float] = []
     if bod and bod.volume_baseline > 0 and volume_baseline_ratio > 0:
-        return int(tick["volume"]) >= bod.volume_baseline * volume_baseline_ratio
-    return False
+        volume_candidates.append(bod.volume_baseline * volume_baseline_ratio)
+    if min_volume_threshold > 0:
+        volume_candidates.append(float(min_volume_threshold))
+    volume_hit = bool(volume_candidates) and int(tick["volume"]) >= max(volume_candidates)
+    turnover_hit = turnover_threshold > 0 and float(tick.get("turnover") or 0) >= turnover_threshold
+    return volume_hit or turnover_hit
 
 
 def is_full_tick_seed_event(raw_event: dict[str, Any]) -> bool:
     return raw_event.get("period") == "full_tick" or raw_event.get("source") == "xtquant_full_tick"
+
+
+def is_minute_bar_source(raw_event: dict[str, Any]) -> bool:
+    period = str(raw_event.get("period") or "").strip().lower()
+    return period in {"1m", "1min", "minute", "minute_bar", "minute_bars"}
 
 
 def is_trade_tick_alert_source(raw_event: dict[str, Any]) -> bool:
@@ -1078,11 +1307,160 @@ def upsert_minute_bar(
     return updated[-420:]
 
 
+def upsert_confirmed_minute_bar(
+    minute_bars: list[dict[str, Any]],
+    bar: dict[str, Any],
+    trade_date: str | None = None,
+) -> list[dict[str, Any]]:
+    minute_ts = minute_bucket(str(bar["timestamp"]))
+    if not is_regular_hk_trading_minute(minute_ts, trade_date):
+        return minute_bars[-420:]
+    normalized = {
+        **bar,
+        "timestamp": minute_ts,
+        "price": float(bar.get("price") or bar.get("close") or 0),
+        "open": float(bar.get("open") or bar.get("price") or bar.get("close") or 0),
+        "high": float(bar.get("high") or bar.get("price") or bar.get("close") or 0),
+        "low": float(bar.get("low") or bar.get("price") or bar.get("close") or 0),
+        "close": float(bar.get("close") or bar.get("price") or 0),
+        "volume": int(bar.get("volume") or 0),
+        "turnover": float(bar.get("turnover") or 0),
+        "is_confirmed_minute_bar": True,
+        "replace": True,
+    }
+    updated: list[dict[str, Any]] = []
+    replaced = False
+    for previous in minute_bars:
+        if not isinstance(previous, dict):
+            continue
+        if minute_bucket(str(previous.get("timestamp") or "")) == minute_ts:
+            updated.append(normalized)
+            replaced = True
+        else:
+            updated.append(previous)
+    if not replaced:
+        updated.append(normalized)
+    updated.sort(key=lambda item: minute_bucket(str(item.get("timestamp") or "")))
+    return updated[-420:]
+
+
+def minute_bar_from_payload(raw_event: dict[str, Any]) -> dict[str, Any] | None:
+    payload = raw_event.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    close = first_float(payload, "close", "price", "last_price", "lastPrice")
+    if close is None or close <= 0:
+        return None
+    timestamp = str(payload.get("timestamp") or payload.get("bar_ts") or raw_event.get("source_ts") or "")
+    if not timestamp:
+        return None
+    return {
+        "timestamp": timestamp,
+        "price": close,
+        "open": first_float(payload, "open") or close,
+        "high": first_float(payload, "high") or close,
+        "low": first_float(payload, "low") or close,
+        "close": close,
+        "volume": int(first_float(payload, "volume", "qty", "quantity") or 0),
+        "turnover": float(first_float(payload, "turnover", "amount") or 0.0),
+        "direction": str(payload.get("direction") or "flat"),
+        "is_confirmed_minute_bar": True,
+        "replace": True,
+    }
+
+
+def update_snapshot_from_minute_bars(state: dict[str, Any], updated_at: str) -> None:
+    minute_bars = prune_future_minute_bars(state.get("minute_bars", []))
+    if not minute_bars:
+        return
+    minute_bars.sort(key=lambda bar: minute_bucket(str(bar.get("timestamp") or "")))
+    state["minute_bars"] = minute_bars[-420:]
+    latest = minute_bars[-1]
+    previous_close = float(state["snapshot"].get("previousClose") or 0)
+    price = float(latest.get("price") or latest.get("close") or previous_close)
+    high = max(float(bar.get("high") or bar.get("price") or price) for bar in minute_bars)
+    low = min(float(bar.get("low") or bar.get("price") or price) for bar in minute_bars)
+    open_price = float(minute_bars[0].get("open") or minute_bars[0].get("price") or price)
+    volume = sum(int(bar.get("volume") or 0) for bar in minute_bars)
+    turnover = sum(float(bar.get("turnover") or 0.0) for bar in minute_bars)
+    state["snapshot"] = {
+        **state["snapshot"],
+        "price": price,
+        "open": open_price,
+        "high": high,
+        "low": low,
+        "volume": volume,
+        "turnover": turnover,
+        "change": price - previous_close,
+        "updatedAt": updated_at,
+    }
+    state["snapshot"]["changePercent"] = 0.0 if previous_close == 0 else state["snapshot"]["change"] / previous_close * 100
+
+
+def first_float(data: dict[str, Any], *keys: str) -> float | None:
+    for key in keys:
+        value = data.get(key)
+        if value in (None, ""):
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
 def minute_bucket(timestamp: str) -> str:
     parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=HK_TZ)
     return parsed.astimezone(HK_TZ).replace(second=0, microsecond=0).isoformat()
+
+
+def is_future_minute_bar(timestamp: str, *, now: datetime | None = None) -> bool:
+    parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=HK_TZ)
+    bar_minute = parsed.astimezone(HK_TZ).replace(second=0, microsecond=0)
+    current_minute = (now or datetime.now(timezone.utc)).astimezone(HK_TZ).replace(second=0, microsecond=0)
+    return bar_minute > current_minute
+
+
+def is_current_or_future_minute_bar(timestamp: str, *, now: datetime | None = None) -> bool:
+    parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=HK_TZ)
+    bar_minute = parsed.astimezone(HK_TZ).replace(second=0, microsecond=0)
+    current_minute = (now or datetime.now(timezone.utc)).astimezone(HK_TZ).replace(second=0, microsecond=0)
+    return bar_minute >= current_minute
+
+
+def prune_future_minute_bars(minute_bars: Any, *, now: datetime | None = None) -> list[dict[str, Any]]:
+    if not isinstance(minute_bars, list):
+        return []
+    pruned: list[dict[str, Any]] = []
+    for bar in minute_bars:
+        if not isinstance(bar, dict):
+            continue
+        timestamp = str(bar.get("timestamp") or "")
+        if not timestamp:
+            continue
+        try:
+            if is_future_minute_bar(timestamp, now=now):
+                continue
+        except ValueError:
+            continue
+        pruned.append(bar)
+    return pruned[-420:]
+
+
+def iso_timestamp_seconds(timestamp: str) -> float:
+    try:
+        parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+    except ValueError:
+        return datetime.now(timezone.utc).timestamp()
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=HK_TZ)
+    return parsed.timestamp()
 
 
 def normalize_raw_broker_queue(payload: dict[str, Any], bod: BodState | None = None) -> dict[str, list[dict[str, Any]]]:
@@ -1137,12 +1515,17 @@ def realtime_freshness(
     trade_date: str,
     *,
     updates_minute_bars: bool = True,
+    updates_latest_bar: bool = False,
 ) -> dict[str, Any]:
     existing = state.get("freshness") if isinstance(state.get("freshness"), dict) else {}
     source_dates = dict(existing.get("source_dates") or {})
     if raw_event.get("kind") == "tick":
         if updates_minute_bars:
             source_dates["minute_bars"] = trade_date
+        if updates_latest_bar:
+            source_dates["latest_bar"] = trade_date
+        if is_full_tick_seed_event(raw_event):
+            source_dates["full_tick"] = trade_date
         source_dates["realtime"] = trade_date
     elif raw_event.get("kind") == "broker_queue":
         source_dates["broker_queue"] = trade_date
@@ -1150,6 +1533,7 @@ def realtime_freshness(
     elif raw_event.get("kind") == "l2_order_book":
         source_dates["l2_order_book"] = trade_date
         source_dates["realtime"] = trade_date
+    degraded_reasons = freshness_degraded_reasons(state, source_dates, trade_date)
     return {
         **existing,
         "updated_at": raw_event["ingest_ts"],
@@ -1159,9 +1543,25 @@ def realtime_freshness(
         "effective_trade_date": trade_date,
         "runtime_state": "LIVE",
         "source_dates": source_dates,
-        "degraded": False,
-        "degraded_reasons": [],
+        "degraded": bool(degraded_reasons),
+        "degraded_reasons": degraded_reasons,
     }
+
+
+def freshness_degraded_reasons(state: dict[str, Any], source_dates: dict[str, Any], trade_date: str) -> list[str]:
+    freshness = state.get("freshness") if isinstance(state.get("freshness"), dict) else {}
+    existing_reasons = [str(reason) for reason in freshness.get("degraded_reasons") or []]
+    minute_bars = state.get("minute_bars") if isinstance(state.get("minute_bars"), list) else []
+    has_confirmed_minute_bars = bool(minute_bars) and source_dates.get("minute_bars") == trade_date
+    reasons: list[str] = []
+    for reason in existing_reasons:
+        if reason in {"missing_minute_bars", "intraday_gap_before_attach"} and has_confirmed_minute_bars:
+            continue
+        if reason not in reasons:
+            reasons.append(reason)
+    if not has_confirmed_minute_bars and "missing_minute_bars" in existing_reasons and "missing_minute_bars" not in reasons:
+        reasons.append("missing_minute_bars")
+    return reasons
 
 
 def rollover_realtime_session(state: dict[str, Any], trade_date: str, updated_at: str) -> None:
@@ -1255,10 +1655,12 @@ def normalize_l2_levels(levels: Any, side: str) -> list[dict[str, Any]]:
     return normalized
 
 
-def volume_baseline(daily_bars: list[dict[str, Any]]) -> float:
+def volume_baseline(daily_bars: list[dict[str, Any]], trade_date: str | None = None) -> float:
     rows = sorted(daily_bars, key=lambda row: str(row.get("trade_date") or ""))
-    if len(rows) >= 2:
-        return float(rows[-2].get("volume") or 0)
+    if trade_date:
+        previous_rows = [row for row in rows if str(row.get("trade_date") or "") < trade_date]
+        if previous_rows:
+            return float(previous_rows[-1].get("volume") or 0)
     if rows:
         return float(rows[-1].get("volume") or 0)
     return 0.0

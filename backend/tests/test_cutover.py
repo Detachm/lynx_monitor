@@ -3907,6 +3907,8 @@ def runtime_config_payload(root: Path) -> dict:
             "persist_realtime_events": True,
             "commit_runtime_owned_raw_offsets": True,
             "big_trade_volume_baseline_ratio": 0.0005,
+            "big_trade_min_volume_threshold": 5_000,
+            "big_trade_turnover_threshold": 1_000_000,
             "install_signal_handlers": True,
         },
         "freshness": {"max_event_age_seconds": 60, "max_queue_backlog": 1000},

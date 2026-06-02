@@ -948,17 +948,22 @@ class OpsTest(unittest.TestCase):
         self.assertEqual(runtime_config.gateway_host, "0.0.0.0")
         self.assertEqual(runtime_config.kafka_spool_dir, "artifacts/runtime-state/kafka-spool")
         self.assertEqual(runtime_config.big_trade_volume_baseline_ratio, 0.0005)
+        self.assertEqual(runtime_config.big_trade_min_volume_threshold, 5_000)
+        self.assertEqual(runtime_config.big_trade_turnover_threshold, 1_000_000)
 
-    def test_runtime_config_loader_rejects_unverified_artifacts(self) -> None:
+    def test_runtime_config_loader_accepts_big_trade_thresholds(self) -> None:
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             silver_root = root / "silver"
             silver_root.mkdir()
             config = runtime_config_payload(silver_root)
+            config["runtime"]["big_trade_min_volume_threshold"] = 10_000
             config["runtime"]["big_trade_turnover_threshold"] = 50_000_000
 
-            with self.assertRaisesRegex(ValueError, "runtime_config_big_trade_turnover_threshold_deprecated"):
-                runtime_config_from_artifact(config)
+            runtime_config = runtime_config_from_artifact(config)
+
+        self.assertEqual(runtime_config.big_trade_min_volume_threshold, 10_000)
+        self.assertEqual(runtime_config.big_trade_turnover_threshold, 50_000_000)
 
     def test_runtime_config_verification_treats_processed_topic_as_optional_shadow_path(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -985,7 +990,8 @@ class OpsTest(unittest.TestCase):
             config["kafka"]["raw_topic"] = "legacy_ticks"
             config["runtime"]["install_signal_handlers"] = False
             config["runtime"]["big_trade_volume_baseline_ratio"] = 0
-            config["runtime"]["big_trade_turnover_threshold"] = 50_000_000
+            config["runtime"]["big_trade_min_volume_threshold"] = 0
+            config["runtime"]["big_trade_turnover_threshold"] = 0
             config["gateway"]["host"] = "127.0.0.1"
             config["production_clients"]["kafka_consumer"] = False
             config["redis"]["password"] = "do-not-store-secrets"
@@ -997,7 +1003,8 @@ class OpsTest(unittest.TestCase):
         self.assertIn("runtime_config_raw_topic_mismatch", result["blockers"])
         self.assertIn("runtime_config_signal_handlers_not_enabled", result["blockers"])
         self.assertIn("runtime_config_big_trade_volume_ratio_invalid", result["blockers"])
-        self.assertIn("runtime_config_big_trade_turnover_threshold_deprecated", result["blockers"])
+        self.assertIn("runtime_config_big_trade_min_volume_threshold_invalid", result["blockers"])
+        self.assertIn("runtime_config_big_trade_turnover_threshold_invalid", result["blockers"])
         self.assertIn("runtime_config_gateway_host_loopback", result["blockers"])
         self.assertIn("runtime_config_production_clients_missing", result["blockers"])
         self.assertIn("runtime_config_contains_secret_like_keys", result["blockers"])
@@ -1008,7 +1015,7 @@ class OpsTest(unittest.TestCase):
             silver_root = root / "silver"
             silver_root.mkdir()
             config = runtime_config_payload(silver_root)
-            config["runtime"]["big_trade_turnover_threshold"] = 50_000_000
+            config["runtime"]["big_trade_turnover_threshold"] = 0
             write_json(root / "runtime-config.json", config)
             output = StringIO()
 
@@ -1028,7 +1035,7 @@ class OpsTest(unittest.TestCase):
         self.assertEqual(exit_code, 1)
         self.assertFalse(summary["passed"])
         self.assertFalse(persisted["passed"])
-        self.assertIn("runtime_config_big_trade_turnover_threshold_deprecated", summary["blockers"])
+        self.assertIn("runtime_config_big_trade_turnover_threshold_invalid", summary["blockers"])
 
     def test_ops_cli_writes_legacy_decommission_evidence(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -4617,6 +4624,8 @@ def runtime_config_payload(silver_root: Path) -> dict:
             "persist_realtime_events": True,
             "commit_runtime_owned_raw_offsets": True,
             "big_trade_volume_baseline_ratio": 0.0005,
+            "big_trade_min_volume_threshold": 5_000,
+            "big_trade_turnover_threshold": 1_000_000,
             "install_signal_handlers": True,
         },
         "freshness": {

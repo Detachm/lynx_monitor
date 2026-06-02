@@ -173,6 +173,8 @@ class ToolDataPathTest(unittest.TestCase):
             bus,
             cache,
             big_trade_volume_baseline_ratio=0.0005,
+            big_trade_min_volume_threshold=1,
+            big_trade_turnover_threshold=100_000_000,
         )
 
         results = runner.bootstrap_snapshots(
@@ -237,6 +239,8 @@ class ToolDataPathTest(unittest.TestCase):
             port=9020,
             path="/ws",
             big_trade_volume_baseline_ratio=0.0005,
+            big_trade_min_volume_threshold=1,
+            big_trade_turnover_threshold=100_000_000,
         )
         manager = service.manager
         runtime_manager = manager.symbol_runtime_manager
@@ -267,6 +271,8 @@ class ToolDataPathTest(unittest.TestCase):
             port=9020,
             path="/ws",
             big_trade_volume_baseline_ratio=0.0005,
+            big_trade_min_volume_threshold=1,
+            big_trade_turnover_threshold=100_000_000,
         )
         manager = service.manager
         runtime_manager = manager.symbol_runtime_manager
@@ -412,11 +418,22 @@ class ToolDataPathTest(unittest.TestCase):
         with self.assertRaises(SystemExit):
             runner.parse_args(["--big-trade-volume-baseline-ratio", "-0.01"])
         with self.assertRaises(SystemExit):
-            runner.parse_args(["--big-trade-turnover-threshold", "1000000"])
+            runner.parse_args(["--big-trade-min-volume-threshold", "0"])
+        with self.assertRaises(SystemExit):
+            runner.parse_args(["--big-trade-turnover-threshold", "0"])
 
-        args = runner.parse_args(["--big-trade-volume-baseline-ratio", "0.001"])
+        args = runner.parse_args([
+            "--big-trade-volume-baseline-ratio",
+            "0.001",
+            "--big-trade-min-volume-threshold",
+            "3000",
+            "--big-trade-turnover-threshold",
+            "2000000",
+        ])
 
         self.assertEqual(args.big_trade_volume_baseline_ratio, 0.001)
+        self.assertEqual(args.big_trade_min_volume_threshold, 3000)
+        self.assertEqual(args.big_trade_turnover_threshold, 2_000_000)
 
     def test_real_data_runner_merges_on_demand_xtquant_refresh_for_cold_symbol(self) -> None:
         runner = load_tool_module(REAL_DATA_RUNNER, "real_data_runner_on_demand_xtquant_test")

@@ -282,7 +282,14 @@ function normalizeTick(raw: JsonRecord, index: number, fallbackTimestamp?: strin
     volume,
     turnover: numberValue(raw.turnover) || price * volume,
     direction: normalizeDirection(raw.direction),
+    replace:
+      booleanValue(raw.replace ?? raw.replace_bar ?? raw.is_confirmed_minute_bar ?? raw.confirmed) ??
+      hasMinuteBarShape(raw),
   }
+}
+
+function hasMinuteBarShape(raw: JsonRecord): boolean {
+  return raw.open !== undefined || raw.high !== undefined || raw.low !== undefined || raw.close !== undefined
 }
 
 function normalizeAlert(raw: JsonRecord, index: number, fallbackTimestamp?: string | null): BigTradeAlert | null {

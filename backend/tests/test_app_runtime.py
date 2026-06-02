@@ -123,6 +123,8 @@ class AppRuntimeTest(unittest.TestCase):
                     trade_date="20260522",
                     silver_root=root,
                     runtime_state_root=root / "artifacts" / "runtime-state",
+                    big_trade_min_volume_threshold=1,
+                    big_trade_turnover_threshold=100_000_000,
                 ),
                 BeastMarketRuntimeClients(
                     kafka_producer=FakeKafkaProducer(),
@@ -279,6 +281,8 @@ class AppRuntimeTest(unittest.TestCase):
                     trade_date="20260522",
                     silver_root=root,
                     runtime_state_root=root / "artifacts" / "runtime-state",
+                    big_trade_min_volume_threshold=1,
+                    big_trade_turnover_threshold=100_000_000,
                 ),
                 BeastMarketRuntimeClients(
                     kafka_producer=FakeKafkaProducer(),
@@ -318,6 +322,8 @@ class AppRuntimeTest(unittest.TestCase):
                     trade_date="20260522",
                     silver_root=root,
                     runtime_state_root=root / "artifacts" / "runtime-state",
+                    big_trade_min_volume_threshold=1,
+                    big_trade_turnover_threshold=100_000_000,
                 ),
                 BeastMarketRuntimeClients(
                     kafka_producer=FakeKafkaProducer(),
@@ -381,6 +387,8 @@ class AppRuntimeTest(unittest.TestCase):
                     trade_date="20260522",
                     silver_root=root,
                     runtime_state_root=root / "artifacts" / "runtime-state",
+                    big_trade_min_volume_threshold=1,
+                    big_trade_turnover_threshold=100_000_000,
                 ),
                 BeastMarketRuntimeClients(
                     kafka_producer=FakeKafkaProducer(),
@@ -423,6 +431,8 @@ class AppRuntimeTest(unittest.TestCase):
                     trade_date="20260522",
                     silver_root=root,
                     runtime_state_root=root / "artifacts" / "runtime-state",
+                    big_trade_min_volume_threshold=1,
+                    big_trade_turnover_threshold=100_000_000,
                 ),
                 BeastMarketRuntimeClients(
                     kafka_producer=FakeKafkaProducer(),
@@ -462,6 +472,8 @@ class AppRuntimeTest(unittest.TestCase):
                     silver_root=root,
                     runtime_state_root=root / "artifacts" / "runtime-state",
                     big_trade_volume_baseline_ratio=0.5,
+                    big_trade_min_volume_threshold=1,
+                    big_trade_turnover_threshold=100_000_000,
                 ),
                 BeastMarketRuntimeClients(
                     kafka_producer=FakeKafkaBroker(),
@@ -479,6 +491,8 @@ class AppRuntimeTest(unittest.TestCase):
                     silver_root=root,
                     runtime_state_root=root / "artifacts" / "runtime-state",
                     big_trade_volume_baseline_ratio=0.5,
+                    big_trade_min_volume_threshold=1,
+                    big_trade_turnover_threshold=100_000_000,
                 ),
                 BeastMarketRuntimeClients(
                     kafka_producer=broker,
@@ -511,7 +525,7 @@ class AppRuntimeTest(unittest.TestCase):
 
         self.assertEqual(first_screen_price, 388.8)
         self.assertIn("00700.HK", runtime.octopus.bod_by_symbol)
-        self.assertEqual([event["result_type"] for event in processed], ["big_trade_alert"])
+        self.assertEqual([event["result_type"] for event in processed], ["snapshot", "big_trade_alert"])
         self.assertEqual(alert["participantName"], "JPMorgan")
 
     def test_hot_cached_subscribe_rehydrates_when_effective_trade_date_has_advanced(self) -> None:
@@ -654,6 +668,8 @@ class AppRuntimeTest(unittest.TestCase):
                     trade_date="20260522",
                     silver_root=root,
                     runtime_state_root=root / "artifacts" / "runtime-state",
+                    big_trade_min_volume_threshold=1,
+                    big_trade_turnover_threshold=100_000_000,
                 ),
                 BeastMarketRuntimeClients(
                     kafka_producer=FakeKafkaProducer(),
@@ -690,6 +706,8 @@ class AppRuntimeTest(unittest.TestCase):
                     trade_date="20260522",
                     silver_root=root,
                     runtime_state_root=root / "artifacts" / "runtime-state",
+                    big_trade_min_volume_threshold=1,
+                    big_trade_turnover_threshold=100_000_000,
                 ),
                 BeastMarketRuntimeClients(
                     kafka_producer=FakeKafkaProducer(),
@@ -864,7 +882,7 @@ class AppRuntimeTest(unittest.TestCase):
         self.assertEqual(rows[0]["reason"], "Kafka event key must match event symbol")
         self.assertEqual(rows[0]["value"]["symbol"], "00700.HK")
 
-    def test_supervisor_tick_drains_small_hktransaction_without_snapshot_write(self) -> None:
+    def test_supervisor_tick_drains_small_hktransaction_into_throttled_latest_bar(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_silver(root)
@@ -914,18 +932,18 @@ class AppRuntimeTest(unittest.TestCase):
 
             snapshot = runtime.cache.get_terminal_snapshot("20260522", "00700.HK")
             self.assertEqual(result["ingested_events"], 1)
-            self.assertEqual(result["processed_events"], 0)
+            self.assertEqual(result["processed_events"], 1)
             self.assertEqual(result["raw_events"][0]["symbol"], "00700.HK")
-            self.assertEqual(result["processed_event_payloads"], [])
-            self.assertEqual(result["terminal_messages"], [])
-            self.assertEqual(result["runtime_terminal_messages"], [])
-            self.assertEqual(result["runtime_processed_events_applied"], 0)
-            self.assertEqual(result["runtime_terminal_messages_enqueued"], 0)
-            self.assertEqual(result["shadow_processed_drained"], 0)
+            self.assertEqual([event["result_type"] for event in result["processed_event_payloads"]], ["snapshot"])
+            self.assertEqual([message["type"] for message in result["terminal_messages"]], ["tick_realtime"])
+            self.assertEqual([message["type"] for message in result["runtime_terminal_messages"]], ["tick_realtime"])
+            self.assertEqual(result["runtime_processed_events_applied"], 1)
+            self.assertEqual(result["runtime_terminal_messages_enqueued"], 1)
+            self.assertEqual(result["shadow_processed_drained"], 1)
             self.assertEqual(runtime.gateway.processed_records_consumed, 0)
-            self.assertEqual(runtime.gateway.shadow_processed_records_drained, 0)
-            self.assertEqual(runtime.gateway.direct_runtime_messages_emitted, 0)
-            self.assertEqual(runtime.gateway.terminal_messages_emitted, 0)
+            self.assertEqual(runtime.gateway.shadow_processed_records_drained, 1)
+            self.assertEqual(runtime.gateway.direct_runtime_messages_emitted, 1)
+            self.assertEqual(runtime.gateway.terminal_messages_emitted, 1)
             self.assertIsNotNone(runtime.raw_consumer_worker.state_provider)
             self.assertIs(
                 runtime.raw_consumer_worker.state_provider("00700.HK"),
@@ -936,13 +954,14 @@ class AppRuntimeTest(unittest.TestCase):
             self.assertEqual(runtime_state_record["ref_count"], 1)
             self.assertTrue(runtime_state_record["realtime_attached"])
             self.assertEqual(runtime_state_record["requested_trade_date"], "20260522")
-            self.assertEqual(snapshot["snapshot"]["price"], 388.8)
+            self.assertEqual(snapshot["snapshot"]["price"], 388.4)
+            self.assertEqual(snapshot["minute_bars"][0]["volume"], 2000)
             self.assertEqual(snapshot["alerts"], [])
             self.assertEqual(runtime.octopus.health.latest_event_at_by_symbol["00700.HK"], "2026-05-22T09:30:00+08:00")
             symbol_runtime_payload = runtime.symbol_runtime_manager.runtimes["00700.HK"].snapshot_payload
             self.assertIsNotNone(symbol_runtime_payload)
-            self.assertEqual(symbol_runtime_payload["snapshot"]["price"], 388.8)
-            self.assertEqual(symbol_runtime_payload["freshness"]["runtime_state"], "WARM")
+            self.assertEqual(symbol_runtime_payload["snapshot"]["price"], 388.4)
+            self.assertEqual(symbol_runtime_payload["freshness"]["runtime_state"], "LIVE")
             self.assertEqual(supervisor.stats.ticks, 1)
             self.assertEqual(runtime.subscription_manager.stats.starts, 1)
             self.assertEqual(runtime.subscription_manager.stats.stops, 1)
@@ -984,8 +1003,8 @@ class AppRuntimeTest(unittest.TestCase):
             supervisor.stop()
 
         self.assertEqual(result["ingested_events"], 7)
-        self.assertEqual(result["processed_events"], 0)
-        self.assertEqual(result["terminal_messages"], [])
+        self.assertEqual(result["processed_events"], 7)
+        self.assertEqual([message["type"] for message in result["terminal_messages"]], ["tick_realtime"] * 7)
         self.assertEqual(broker.committed("raw_market_events_v1"), 7)
 
     def test_runtime_owned_raw_commit_failure_does_not_drop_realtime_snapshot(self) -> None:
@@ -1028,8 +1047,8 @@ class AppRuntimeTest(unittest.TestCase):
             supervisor.stop()
 
         self.assertEqual(result["ingested_events"], 1)
-        self.assertEqual(result["processed_events"], 0)
-        self.assertEqual(result["terminal_messages"], [])
+        self.assertEqual(result["processed_events"], 1)
+        self.assertEqual([message["type"] for message in result["terminal_messages"]], ["tick_realtime"])
         self.assertEqual(runtime.raw_consumer_worker.stats.failed, 1)
         self.assertIn(
             "runtime_owned_raw_commit_failed",
@@ -1171,7 +1190,8 @@ class AppRuntimeTest(unittest.TestCase):
         self.assertGreaterEqual(persisted["redis"]["write_stats"]["max_latency_ms"], 0)
         self.assertEqual(len(persisted["performance_samples"]["subscribe_snapshot_ms"]), 1)
         self.assertGreaterEqual(persisted["performance_samples"]["subscribe_snapshot_ms"][0], 0)
-        self.assertEqual(queued, [])
+        self.assertEqual([message["type"] for message in queued], ["tick_realtime"])
+        self.assertEqual(queued[0]["payload"]["tick"]["volume"], 1000)
         self.assertEqual(persisted["subscription"]["subscribed_symbols"], ["00700.HK"])
         self.assertEqual(persisted["symbol_runtime_manager"]["runtime_count"], 1)
         self.assertEqual(persisted["symbol_runtime_manager"]["total_ref_count"], 1)
@@ -1247,9 +1267,9 @@ class AppRuntimeTest(unittest.TestCase):
         self.assertEqual(persisted["gateway_websocket"]["failed_client_sends"], 0)
         self.assertGreater(persisted["gateway_websocket"]["send_timeout_seconds"], 0)
         self.assertEqual(persisted["gateway_activity"]["processed_records_consumed"], 0)
-        self.assertEqual(persisted["gateway_activity"]["shadow_processed_records_drained"], 0)
-        self.assertEqual(persisted["gateway_activity"]["direct_runtime_messages_emitted"], 0)
-        self.assertEqual(persisted["gateway_activity"]["terminal_messages_emitted"], 0)
+        self.assertEqual(persisted["gateway_activity"]["shadow_processed_records_drained"], 1)
+        self.assertEqual(persisted["gateway_activity"]["direct_runtime_messages_emitted"], 1)
+        self.assertEqual(persisted["gateway_activity"]["terminal_messages_emitted"], 1)
         self.assertEqual(persisted["gateway_activity"]["terminal_messages_delivered"], 0)
         self.assertEqual(persisted["gateway_activity"]["delivered_terminal_symbols"], [])
         self.assertIsNone(persisted["gateway_activity"]["last_terminal_message_delivered_at"])
@@ -1489,6 +1509,8 @@ class AppRuntimeTest(unittest.TestCase):
                     trade_date="20260522",
                     silver_root=root,
                     runtime_state_root=root / "artifacts" / "runtime-state",
+                    big_trade_min_volume_threshold=1,
+                    big_trade_turnover_threshold=100_000_000,
                 ),
                 BeastMarketRuntimeClients(
                     kafka_producer=FakeKafkaBroker(),
@@ -1551,6 +1573,8 @@ class AppRuntimeTest(unittest.TestCase):
                     trade_date="20260522",
                     silver_root=root,
                     runtime_state_root=root / "artifacts" / "runtime-state",
+                    big_trade_min_volume_threshold=1,
+                    big_trade_turnover_threshold=100_000_000,
                 ),
                 BeastMarketRuntimeClients(
                     kafka_producer=FakeKafkaBroker(),
@@ -1612,6 +1636,8 @@ class AppRuntimeTest(unittest.TestCase):
                     trade_date="20260522",
                     silver_root=root,
                     runtime_state_root=root / "artifacts" / "runtime-state",
+                    big_trade_min_volume_threshold=1,
+                    big_trade_turnover_threshold=100_000_000,
                 ),
                 BeastMarketRuntimeClients(
                     kafka_producer=FakeKafkaBroker(),
@@ -1640,6 +1666,8 @@ class AppRuntimeTest(unittest.TestCase):
                     trade_date="20260522",
                     silver_root=root,
                     runtime_state_root=root / "artifacts" / "runtime-state",
+                    big_trade_min_volume_threshold=1,
+                    big_trade_turnover_threshold=100_000_000,
                 ),
                 BeastMarketRuntimeClients(
                     kafka_producer=FakeKafkaBroker(),
@@ -1843,7 +1871,7 @@ class AppRuntimeTest(unittest.TestCase):
         self.assertEqual(snapshot["freshness"]["source_dates"]["minute_bars"], "")
         self.assertIn("intraday_gap_before_attach", snapshot["freshness"]["degraded_reasons"])
 
-    def test_cold_hydration_seeds_realtime_minute_bar_from_full_tick(self) -> None:
+    def test_cold_hydration_updates_snapshot_from_full_tick_without_minute_bar(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_silver(root)
@@ -1887,10 +1915,12 @@ class AppRuntimeTest(unittest.TestCase):
             snapshot = hydrate_symbol_snapshot(runtime, "00700.HK")
 
         self.assertEqual(snapshot["snapshot"]["tradeDate"], "20260525")
-        self.assertEqual(snapshot["minute_bars"][0]["timestamp"], "2026-05-25T09:31:00+08:00")
-        self.assertEqual(snapshot["minute_bars"][0]["close"], 390.0)
-        self.assertEqual(snapshot["freshness"]["source_dates"]["minute_bars"], "20260525")
-        self.assertNotIn("intraday_gap_before_attach", snapshot["freshness"]["degraded_reasons"])
+        self.assertEqual(snapshot["snapshot"]["price"], 390.0)
+        self.assertEqual(snapshot["snapshot"]["volume"], 12345)
+        self.assertEqual(snapshot["minute_bars"], [])
+        self.assertEqual(snapshot["freshness"]["source_dates"]["minute_bars"], "")
+        self.assertEqual(snapshot["freshness"]["source_dates"]["full_tick"], "20260525")
+        self.assertIn("intraday_gap_before_attach", snapshot["freshness"]["degraded_reasons"])
 
     def test_attach_realtime_accepts_truthy_non_builtin_trading_day_value(self) -> None:
         class TruthyTradingDay:
@@ -1934,7 +1964,7 @@ class AppRuntimeTest(unittest.TestCase):
         self.assertTrue(should_attach_realtime_for_symbol(runtime, "00700.HK"))
         self.assertEqual(runtime.mammoth.args, ("20260602", "HK"))
 
-    def test_full_tick_seed_populates_today_snapshot_and_minute_bar(self) -> None:
+    def test_full_tick_seed_populates_today_snapshot_without_minute_bar(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_silver(root)
@@ -1979,8 +2009,9 @@ class AppRuntimeTest(unittest.TestCase):
         self.assertEqual(cached["snapshot"]["tradeDate"], "20260525")
         self.assertEqual(cached["snapshot"]["price"], 390.0)
         self.assertEqual(cached["snapshot"]["volume"], 12345)
-        self.assertEqual(cached["minute_bars"][0]["timestamp"], "2026-05-25T09:31:00+08:00")
-        self.assertEqual(cached["minute_bars"][0]["close"], 390.0)
+        self.assertEqual(cached["minute_bars"], [])
+        self.assertEqual(cached["freshness"]["source_dates"]["minute_bars"], "")
+        self.assertEqual(cached["freshness"]["source_dates"]["full_tick"], "20260525")
         self.assertEqual(cached["freshness"]["runtime_state"], "LIVE")
 
     def test_running_runtime_subscribes_new_symbol_not_in_startup_watchlist(self) -> None:
@@ -2085,9 +2116,11 @@ class AppRuntimeTest(unittest.TestCase):
             supervisor.stop()
 
         self.assertEqual(messages[0]["type"], "snapshot")
-        self.assertEqual(messages[0]["payload"]["minute_bars"][0]["timestamp"], "2026-05-25T09:32:00+08:00")
-        self.assertEqual(messages[0]["payload"]["freshness"]["source_dates"]["minute_bars"], "20260525")
-        self.assertNotIn("intraday_gap_before_attach", messages[0]["payload"]["freshness"]["degraded_reasons"])
+        self.assertEqual(messages[0]["payload"]["snapshot"]["price"], 391.0)
+        self.assertEqual(messages[0]["payload"]["minute_bars"], [])
+        self.assertEqual(messages[0]["payload"]["freshness"]["source_dates"]["minute_bars"], "")
+        self.assertEqual(messages[0]["payload"]["freshness"]["source_dates"]["full_tick"], "20260525")
+        self.assertIn("intraday_gap_before_attach", messages[0]["payload"]["freshness"]["degraded_reasons"])
 
     def test_run_supervised_runtime_owns_lifecycle_websocket_and_health_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -2,6 +2,7 @@ import copy
 import csv
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from beast_market import (
@@ -16,10 +17,58 @@ from beast_market import (
     make_raw_market_event,
     validate_terminal_message,
 )
-from beast_market.pipeline import to_broker_queue
+from beast_market.pipeline import (
+    is_current_or_future_minute_bar,
+    is_future_minute_bar,
+    prune_future_minute_bars,
+    to_broker_queue,
+    volume_baseline,
+)
+
+
+HK_TZ = timezone(timedelta(hours=8))
 
 
 class BackendV2PipelineTest(unittest.TestCase):
+    def test_is_future_minute_bar_uses_current_hk_minute(self) -> None:
+        lunch_break = datetime(2026, 6, 2, 12, 47, 30, tzinfo=HK_TZ)
+
+        self.assertFalse(is_future_minute_bar("2026-06-02T11:59:00+08:00", now=lunch_break))
+        self.assertFalse(is_future_minute_bar("2026-06-02T12:47:00+08:00", now=lunch_break))
+        self.assertTrue(is_future_minute_bar("2026-06-02T13:01:00+08:00", now=lunch_break))
+
+    def test_current_or_future_minute_bar_rejects_unclosed_confirmed_bars(self) -> None:
+        during_opening_minute = datetime(2026, 6, 2, 13, 0, 45, tzinfo=HK_TZ)
+
+        self.assertFalse(is_current_or_future_minute_bar("2026-06-02T11:59:00+08:00", now=during_opening_minute))
+        self.assertTrue(is_current_or_future_minute_bar("2026-06-02T13:00:00+08:00", now=during_opening_minute))
+        self.assertTrue(is_current_or_future_minute_bar("2026-06-02T13:01:00+08:00", now=during_opening_minute))
+
+    def test_prune_future_minute_bars_drops_existing_future_placeholders(self) -> None:
+        lunch_break = datetime(2026, 6, 2, 12, 47, 30, tzinfo=HK_TZ)
+
+        pruned = prune_future_minute_bars(
+            [
+                {"timestamp": "2026-06-02T11:59:00+08:00", "volume": 100},
+                {"timestamp": "2026-06-02T13:01:00+08:00", "volume": 0},
+            ],
+            now=lunch_break,
+        )
+
+        self.assertEqual([bar["timestamp"] for bar in pruned], ["2026-06-02T11:59:00+08:00"])
+
+    def test_volume_baseline_uses_latest_daily_bar_before_requested_trade_date(self) -> None:
+        self.assertEqual(
+            volume_baseline(
+                [
+                    {"trade_date": "20260529", "volume": 100},
+                    {"trade_date": "20260601", "volume": 200},
+                ],
+                "20260602",
+            ),
+            200,
+        )
+
     def test_mammoth_api_manifest_and_vertical_v2_flow(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -143,7 +192,7 @@ class BackendV2PipelineTest(unittest.TestCase):
             self.assertTrue(terminal[1]["payload"]["alert"]["isHighlighted"])
             self.assertEqual(terminal[2]["payload"]["broker_queue"]["bid"][0]["brokerCode"], "UBS")
 
-    def test_hktransaction_below_big_trade_threshold_does_not_write_redis_or_broadcast(self) -> None:
+    def test_hktransaction_below_big_trade_threshold_updates_latest_bar_without_alert(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_silver_tables(root)
@@ -157,8 +206,6 @@ class BackendV2PipelineTest(unittest.TestCase):
                 big_trade_volume_baseline_ratio=0.0005,
             )
             octopus.preload_bod("00700.HK", "20260522")
-            before = copy.deepcopy(cache.get_terminal_snapshot("20260522", "00700.HK"))
-
             small_trade = make_raw_market_event(
                 kind="tick",
                 symbol="00700.HK",
@@ -177,12 +224,15 @@ class BackendV2PipelineTest(unittest.TestCase):
 
             processed = octopus.process_raw_event(small_trade, "20260522")
 
-            self.assertEqual(processed, [])
-            self.assertEqual(bus.read(PROCESSED_TOPIC), [])
-            self.assertEqual(cache.get_terminal_snapshot("20260522", "00700.HK"), before)
+            self.assertEqual([event["result_type"] for event in processed], ["snapshot"])
+            cached = cache.get_terminal_snapshot("20260522", "00700.HK")
+            self.assertEqual(cached["snapshot"]["price"], 389.0)
+            self.assertEqual(cached["minute_bars"][0]["volume"], 1999)
+            self.assertEqual(cached["alerts"], [])
+            self.assertEqual(cached["freshness"]["source_dates"]["latest_bar"], "20260522")
             self.assertEqual(octopus.health.latest_event_at_by_symbol["00700.HK"], "2026-05-22T09:30:05+08:00")
 
-    def test_hktransaction_big_trade_writes_only_alert_read_model(self) -> None:
+    def test_hktransaction_big_trade_updates_latest_bar_and_alert_read_model(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_silver_tables(root)
@@ -196,8 +246,6 @@ class BackendV2PipelineTest(unittest.TestCase):
                 big_trade_volume_baseline_ratio=0.0005,
             )
             octopus.preload_bod("00700.HK", "20260522")
-            initial_price = cache.get_terminal_snapshot("20260522", "00700.HK")["snapshot"]["price"]
-
             big_trade = make_raw_market_event(
                 kind="tick",
                 symbol="00700.HK",
@@ -216,14 +264,16 @@ class BackendV2PipelineTest(unittest.TestCase):
 
             processed = octopus.process_raw_event(big_trade, "20260522")
 
-            self.assertEqual([event["result_type"] for event in processed], ["big_trade_alert"])
+            self.assertEqual([event["result_type"] for event in processed], ["snapshot", "big_trade_alert"])
             cached = cache.get_terminal_snapshot("20260522", "00700.HK")
-            self.assertEqual(cached["snapshot"]["price"], initial_price)
+            self.assertEqual(cached["snapshot"]["price"], 389.0)
+            self.assertEqual(cached["minute_bars"][0]["volume"], 101000)
             self.assertEqual(cached["alerts"][0]["price"], 389.0)
             self.assertEqual(cached["alerts"][0]["participantName"], "JPMorgan Chase Bank, N.A.")
             terminal = GatewayV2(bus, cache).to_terminal_messages()
-            self.assertEqual([message["type"] for message in terminal], ["alert_realtime"])
-            validate_terminal_message(terminal[0])
+            self.assertEqual([message["type"] for message in terminal], ["tick_realtime", "alert_realtime"])
+            for message in terminal:
+                validate_terminal_message(message)
 
     def test_first_same_day_tick_rolls_preopen_fallback_snapshot_to_live_session(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -379,7 +429,7 @@ class BackendV2PipelineTest(unittest.TestCase):
             self.assertEqual(alert["participantName"], "Kingston Securities")
             self.assertEqual(alert["brokerName"], "Kingston Securities")
 
-    def test_big_trade_alert_uses_previous_day_volume_ratio_not_fixed_turnover(self) -> None:
+    def test_big_trade_alert_uses_turnover_threshold_for_small_volume_prints(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_silver_tables(root)
@@ -411,8 +461,8 @@ class BackendV2PipelineTest(unittest.TestCase):
             )
             processed = octopus.process_raw_event(high_turnover_small_volume, "20260522")
 
-            self.assertEqual(processed, [])
-            self.assertEqual(cache.get_terminal_snapshot("20260522", "00700.HK")["alerts"], [])
+            self.assertEqual([event["result_type"] for event in processed], ["snapshot", "big_trade_alert"])
+            self.assertEqual(cache.get_terminal_snapshot("20260522", "00700.HK")["alerts"][0]["turnover"], 10_000_000)
 
     def test_big_trade_alert_marks_source_undisclosed_broker_codes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -521,6 +571,102 @@ class BackendV2PipelineTest(unittest.TestCase):
             self.assertEqual(cached["minute_bars"][1]["timestamp"], "2026-05-22T09:31:00+08:00")
             self.assertEqual(cached["minute_bars"][1]["volume"], 2300)
 
+    def test_confirmed_1m_bar_replaces_tick_aggregated_latest_bar(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_silver_tables(root)
+
+            bus = InMemoryEventBus()
+            cache = InMemoryRedisSnapshotCache()
+            octopus = OctopusComputeV2(MammothAPI(root), bus, cache, big_trade_volume_baseline_ratio=2.0)
+            octopus.preload_bod("00700.HK", "20260522")
+
+            octopus.process_raw_event(
+                make_raw_market_event(
+                    kind="tick",
+                    symbol="00700.HK",
+                    source="xtquant",
+                    period="hktransaction",
+                    seq=1,
+                    source_ts="2026-05-22T09:32:05+08:00",
+                    payload={"price": 389.0, "volume": 900, "turnover": 350100, "side": "buy"},
+                ),
+                "20260522",
+            )
+            self.assertEqual(octopus.get_state("00700.HK")["minute_bars"][-1]["volume"], 900)
+
+            processed = octopus.process_raw_event(
+                make_raw_market_event(
+                    kind="tick",
+                    symbol="00700.HK",
+                    source="xtquant",
+                    period="1m",
+                    seq=2,
+                    source_ts="2026-05-22T09:32:00+08:00",
+                    payload={
+                        "timestamp": "2026-05-22T09:32:00+08:00",
+                        "price": 389.2,
+                        "open": 389.0,
+                        "high": 389.4,
+                        "low": 388.8,
+                        "close": 389.2,
+                        "volume": 1200,
+                        "turnover": 467040,
+                    },
+                ),
+                "20260522",
+            )
+
+            cached = cache.get_terminal_snapshot("20260522", "00700.HK")
+            self.assertEqual([event["result_type"] for event in processed], ["snapshot"])
+            self.assertEqual(cached["minute_bars"][-1]["timestamp"], "2026-05-22T09:32:00+08:00")
+            self.assertEqual(cached["minute_bars"][-1]["volume"], 1200)
+            self.assertEqual(cached["minute_bars"][-1]["price"], 389.2)
+            self.assertTrue(cached["minute_bars"][-1]["replace"])
+            self.assertEqual(cached["freshness"]["source_dates"]["minute_bars"], "20260522")
+
+    def test_hktransaction_latest_bar_is_throttled_within_same_second(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_silver_tables(root)
+
+            bus = InMemoryEventBus()
+            cache = InMemoryRedisSnapshotCache()
+            octopus = OctopusComputeV2(MammothAPI(root), bus, cache, big_trade_volume_baseline_ratio=2.0)
+            octopus.preload_bod("00700.HK", "20260522")
+
+            first = octopus.process_raw_event(
+                make_raw_market_event(
+                    kind="tick",
+                    symbol="00700.HK",
+                    source="xtquant",
+                    period="hktransaction",
+                    seq=1,
+                    source_ts="2026-05-22T09:32:05+08:00",
+                    payload={"price": 389.0, "volume": 100, "turnover": 38900, "side": "buy"},
+                ),
+                "20260522",
+            )
+            second = octopus.process_raw_event(
+                make_raw_market_event(
+                    kind="tick",
+                    symbol="00700.HK",
+                    source="xtquant",
+                    period="hktransaction",
+                    seq=2,
+                    source_ts="2026-05-22T09:32:05.500000+08:00",
+                    payload={"price": 389.2, "volume": 200, "turnover": 77840, "side": "buy"},
+                ),
+                "20260522",
+            )
+            state = octopus.get_state("00700.HK")
+
+            self.assertEqual([event["result_type"] for event in first], ["snapshot"])
+            self.assertEqual(second, [])
+            self.assertEqual(len(bus.read(PROCESSED_TOPIC)), 1)
+            self.assertEqual(state["minute_bars"][-1]["volume"], 300)
+            self.assertEqual(state["minute_bars"][-1]["price"], 389.2)
+
     def test_octopus_applies_l2_order_book_enhancement_to_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -586,6 +732,8 @@ class BackendV2PipelineTest(unittest.TestCase):
                 bus,
                 cache,
                 big_trade_volume_baseline_ratio=0.00001,
+                big_trade_min_volume_threshold=1,
+                big_trade_turnover_threshold=100_000_000,
             )
             external_state = copy.deepcopy(octopus.preload_bod("00700.HK", "20260522"))
             octopus.state_by_symbol.clear()
@@ -609,6 +757,8 @@ class BackendV2PipelineTest(unittest.TestCase):
                 InMemoryEventBus(),
                 InMemoryRedisSnapshotCache(),
                 big_trade_volume_baseline_ratio=0.00001,
+                big_trade_min_volume_threshold=1,
+                big_trade_turnover_threshold=100_000_000,
             )
             state = octopus.preload_bod("00700.HK", "20260522")
             raw_event = raw_tick(seq=1, source_ts="2026-05-22T09:32:05+08:00", price=389.4, volume=100)
@@ -633,9 +783,23 @@ class BackendV2PipelineTest(unittest.TestCase):
                 InMemoryEventBus(),
                 InMemoryRedisSnapshotCache(),
                 big_trade_volume_baseline_ratio=0.00001,
+                big_trade_min_volume_threshold=1,
+                big_trade_turnover_threshold=100_000_000,
             )
             state = octopus.preload_bod("00700.HK", "20260522")
             initial_alert_count = len(state["alerts"])
+            state["minute_bars"].append(
+                {
+                    "timestamp": "2099-01-05T09:30:00+08:00",
+                    "price": 999.0,
+                    "open": 999.0,
+                    "high": 999.0,
+                    "low": 999.0,
+                    "close": 999.0,
+                    "volume": 0,
+                    "turnover": 0.0,
+                }
+            )
             raw_event = make_raw_market_event(
                 kind="tick",
                 symbol="00700.HK",
@@ -656,6 +820,7 @@ class BackendV2PipelineTest(unittest.TestCase):
 
             self.assertEqual(update.state["snapshot"]["price"], 389.4)
             self.assertEqual(update.state["snapshot"]["volume"], 5_000_000)
+            self.assertNotIn("2099-01-05T09:30:00+08:00", [bar["timestamp"] for bar in update.state["minute_bars"]])
             self.assertIsNone(update.alert)
             self.assertEqual(len(update.state["alerts"]), initial_alert_count)
 

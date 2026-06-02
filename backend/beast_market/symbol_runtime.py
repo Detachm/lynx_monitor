@@ -841,6 +841,20 @@ def upsert_minute_bar(existing: Any, tick: dict[str, Any], *, trade_date: str | 
             previous_price = float(bar.get("price") or bar.get("close") or tick_price)
             previous_high = float(bar.get("high") or previous_price)
             previous_low = float(bar.get("low") or previous_price)
+            if tick.get("replace") is True:
+                bars[index] = {
+                    **bar,
+                    **tick,
+                    "timestamp": minute_ts,
+                    "price": tick_price,
+                    "close": tick_price,
+                    "open": float(tick.get("open") or bar.get("open") or previous_price),
+                    "high": float(tick.get("high") or tick_price),
+                    "low": float(tick.get("low") or tick_price),
+                    "volume": tick_volume,
+                    "turnover": tick_turnover,
+                }
+                break
             bars[index] = {
                 **bar,
                 **tick,

@@ -260,4 +260,6 @@ def snapshot_needs_realtime_seed(payload: dict[str, Any], trade_date: str) -> bo
         return True
     if not isinstance(minute_bars, list) or not minute_bars:
         return True
-    return not isinstance(source_dates, dict) or source_dates.get("minute_bars") != trade_date
+    if not isinstance(source_dates, dict):
+        return True
+    return source_dates.get("minute_bars") != trade_date and source_dates.get("latest_bar") != trade_date
