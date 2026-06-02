@@ -494,6 +494,7 @@ class AppRuntimeTest(unittest.TestCase):
                     kind="tick",
                     symbol="00700.HK",
                     source="xtquant",
+                    period="hktransaction",
                     seq=1,
                     source_ts="2026-05-22T09:32:00+08:00",
                     payload={
@@ -510,7 +511,7 @@ class AppRuntimeTest(unittest.TestCase):
 
         self.assertEqual(first_screen_price, 388.8)
         self.assertIn("00700.HK", runtime.octopus.bod_by_symbol)
-        self.assertEqual([event["result_type"] for event in processed], ["snapshot", "big_trade_alert"])
+        self.assertEqual([event["result_type"] for event in processed], ["big_trade_alert"])
         self.assertEqual(alert["participantName"], "JPMorgan")
 
     def test_hot_cached_subscribe_rehydrates_when_effective_trade_date_has_advanced(self) -> None:
@@ -863,7 +864,7 @@ class AppRuntimeTest(unittest.TestCase):
         self.assertEqual(rows[0]["reason"], "Kafka event key must match event symbol")
         self.assertEqual(rows[0]["value"]["symbol"], "00700.HK")
 
-    def test_supervisor_tick_drains_ingest_processes_raw_and_updates_snapshot(self) -> None:
+    def test_supervisor_tick_drains_small_hktransaction_without_snapshot_write(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_minimal_silver(root)
@@ -901,6 +902,7 @@ class AppRuntimeTest(unittest.TestCase):
             runtime.ingest_worker.receive_callback(
                 {
                     "code": "700",
+                    "period": "hktransaction",
                     "timestamp": "2026-05-22T09:30:00+08:00",
                     "price": 388.4,
                     "volume": 1000,
@@ -912,19 +914,18 @@ class AppRuntimeTest(unittest.TestCase):
 
             snapshot = runtime.cache.get_terminal_snapshot("20260522", "00700.HK")
             self.assertEqual(result["ingested_events"], 1)
-            self.assertEqual(result["processed_events"], 1)
+            self.assertEqual(result["processed_events"], 0)
             self.assertEqual(result["raw_events"][0]["symbol"], "00700.HK")
-            self.assertEqual(result["processed_event_payloads"][0]["symbol"], "00700.HK")
-            self.assertEqual(result["terminal_messages"][0]["type"], "tick_realtime")
-            self.assertEqual(result["terminal_messages"][0]["source_ts"], "2026-05-22T09:30:00+08:00")
-            self.assertEqual(result["runtime_terminal_messages"][0]["type"], "tick_realtime")
-            self.assertEqual(result["runtime_processed_events_applied"], 1)
-            self.assertEqual(result["runtime_terminal_messages_enqueued"], 1)
-            self.assertEqual(result["shadow_processed_drained"], 1)
+            self.assertEqual(result["processed_event_payloads"], [])
+            self.assertEqual(result["terminal_messages"], [])
+            self.assertEqual(result["runtime_terminal_messages"], [])
+            self.assertEqual(result["runtime_processed_events_applied"], 0)
+            self.assertEqual(result["runtime_terminal_messages_enqueued"], 0)
+            self.assertEqual(result["shadow_processed_drained"], 0)
             self.assertEqual(runtime.gateway.processed_records_consumed, 0)
-            self.assertEqual(runtime.gateway.shadow_processed_records_drained, 1)
-            self.assertEqual(runtime.gateway.direct_runtime_messages_emitted, 1)
-            self.assertEqual(runtime.gateway.terminal_messages_emitted, 1)
+            self.assertEqual(runtime.gateway.shadow_processed_records_drained, 0)
+            self.assertEqual(runtime.gateway.direct_runtime_messages_emitted, 0)
+            self.assertEqual(runtime.gateway.terminal_messages_emitted, 0)
             self.assertIsNotNone(runtime.raw_consumer_worker.state_provider)
             self.assertIs(
                 runtime.raw_consumer_worker.state_provider("00700.HK"),
@@ -935,11 +936,13 @@ class AppRuntimeTest(unittest.TestCase):
             self.assertEqual(runtime_state_record["ref_count"], 1)
             self.assertTrue(runtime_state_record["realtime_attached"])
             self.assertEqual(runtime_state_record["requested_trade_date"], "20260522")
-            self.assertEqual(snapshot["snapshot"]["price"], 388.4)
+            self.assertEqual(snapshot["snapshot"]["price"], 388.8)
+            self.assertEqual(snapshot["alerts"], [])
+            self.assertEqual(runtime.octopus.health.latest_event_at_by_symbol["00700.HK"], "2026-05-22T09:30:00+08:00")
             symbol_runtime_payload = runtime.symbol_runtime_manager.runtimes["00700.HK"].snapshot_payload
             self.assertIsNotNone(symbol_runtime_payload)
-            self.assertEqual(symbol_runtime_payload["snapshot"]["price"], 388.4)
-            self.assertEqual(symbol_runtime_payload["freshness"]["runtime_state"], "LIVE")
+            self.assertEqual(symbol_runtime_payload["snapshot"]["price"], 388.8)
+            self.assertEqual(symbol_runtime_payload["freshness"]["runtime_state"], "WARM")
             self.assertEqual(supervisor.stats.ticks, 1)
             self.assertEqual(runtime.subscription_manager.stats.starts, 1)
             self.assertEqual(runtime.subscription_manager.stats.stops, 1)
@@ -969,6 +972,7 @@ class AppRuntimeTest(unittest.TestCase):
                 runtime.ingest_worker.receive_callback(
                     {
                         "code": "700",
+                        "period": "hktransaction",
                         "timestamp": f"2026-05-22T09:3{index}:00+08:00",
                         "price": 388.4 + index,
                         "volume": 1000 + index,
@@ -980,7 +984,8 @@ class AppRuntimeTest(unittest.TestCase):
             supervisor.stop()
 
         self.assertEqual(result["ingested_events"], 7)
-        self.assertEqual(result["processed_events"], 7)
+        self.assertEqual(result["processed_events"], 0)
+        self.assertEqual(result["terminal_messages"], [])
         self.assertEqual(broker.committed("raw_market_events_v1"), 7)
 
     def test_runtime_owned_raw_commit_failure_does_not_drop_realtime_snapshot(self) -> None:
@@ -1011,6 +1016,7 @@ class AppRuntimeTest(unittest.TestCase):
             runtime.ingest_worker.receive_callback(
                 {
                     "code": "700",
+                    "period": "hktransaction",
                     "timestamp": "2026-05-22T09:30:00+08:00",
                     "price": 388.4,
                     "volume": 1000,
@@ -1022,8 +1028,8 @@ class AppRuntimeTest(unittest.TestCase):
             supervisor.stop()
 
         self.assertEqual(result["ingested_events"], 1)
-        self.assertEqual(result["processed_events"], 1)
-        self.assertEqual(result["terminal_messages"][0]["type"], "tick_realtime")
+        self.assertEqual(result["processed_events"], 0)
+        self.assertEqual(result["terminal_messages"], [])
         self.assertEqual(runtime.raw_consumer_worker.stats.failed, 1)
         self.assertIn(
             "runtime_owned_raw_commit_failed",
@@ -1126,6 +1132,7 @@ class AppRuntimeTest(unittest.TestCase):
             runtime.ingest_worker.receive_callback(
                 {
                     "code": "700",
+                    "period": "hktransaction",
                     "timestamp": "2026-05-22T09:30:00+08:00",
                     "price": 388.4,
                     "volume": 1000,
@@ -1164,8 +1171,7 @@ class AppRuntimeTest(unittest.TestCase):
         self.assertGreaterEqual(persisted["redis"]["write_stats"]["max_latency_ms"], 0)
         self.assertEqual(len(persisted["performance_samples"]["subscribe_snapshot_ms"]), 1)
         self.assertGreaterEqual(persisted["performance_samples"]["subscribe_snapshot_ms"][0], 0)
-        self.assertEqual(queued[0]["type"], "tick_realtime")
-        self.assertEqual(queued[0]["symbol"], "00700.HK")
+        self.assertEqual(queued, [])
         self.assertEqual(persisted["subscription"]["subscribed_symbols"], ["00700.HK"])
         self.assertEqual(persisted["symbol_runtime_manager"]["runtime_count"], 1)
         self.assertEqual(persisted["symbol_runtime_manager"]["total_ref_count"], 1)
@@ -1241,9 +1247,9 @@ class AppRuntimeTest(unittest.TestCase):
         self.assertEqual(persisted["gateway_websocket"]["failed_client_sends"], 0)
         self.assertGreater(persisted["gateway_websocket"]["send_timeout_seconds"], 0)
         self.assertEqual(persisted["gateway_activity"]["processed_records_consumed"], 0)
-        self.assertEqual(persisted["gateway_activity"]["shadow_processed_records_drained"], 1)
-        self.assertEqual(persisted["gateway_activity"]["direct_runtime_messages_emitted"], 1)
-        self.assertEqual(persisted["gateway_activity"]["terminal_messages_emitted"], 1)
+        self.assertEqual(persisted["gateway_activity"]["shadow_processed_records_drained"], 0)
+        self.assertEqual(persisted["gateway_activity"]["direct_runtime_messages_emitted"], 0)
+        self.assertEqual(persisted["gateway_activity"]["terminal_messages_emitted"], 0)
         self.assertEqual(persisted["gateway_activity"]["terminal_messages_delivered"], 0)
         self.assertEqual(persisted["gateway_activity"]["delivered_terminal_symbols"], [])
         self.assertIsNone(persisted["gateway_activity"]["last_terminal_message_delivered_at"])
@@ -1498,6 +1504,7 @@ class AppRuntimeTest(unittest.TestCase):
                     kind="tick",
                     symbol="00700.HK",
                     source="xtquant",
+                    period="hktransaction",
                     seq=1,
                     source_ts="2026-05-22T09:30:00+08:00",
                     payload={"price": 388.4, "volume": 1000, "turnover": 388400, "side": "buy"},

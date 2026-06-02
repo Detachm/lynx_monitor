@@ -484,6 +484,9 @@ class OctopusComputeV2:
         if raw_event["kind"] != "tick":
             return []
 
+        if is_trade_tick_alert_source(raw_event):
+            return self.process_trade_tick_alert_event(raw_event, trade_date, state)
+
         processed_events: list[dict[str, Any]] = []
         self.seq_by_symbol[symbol] += 1
         update = self.apply_tick_to_state(state, raw_event, trade_date)
@@ -535,7 +538,7 @@ class OctopusComputeV2:
             "turnover": float(payload["turnover"]),
             "direction": "flat",
         }
-        is_full_tick_seed = raw_event.get("period") == "full_tick" or raw_event.get("source") == "xtquant_full_tick"
+        is_full_tick_seed = is_full_tick_seed_event(raw_event)
         rollover = snapshot_trade_date(state) != trade_date
         if rollover:
             rollover_previous_close = float(
@@ -593,8 +596,23 @@ class OctopusComputeV2:
         chart initialization must stay on native 1m bars.
         """
         symbol = raw_event["symbol"]
-        if symbol not in self.state_by_symbol or raw_event["kind"] != "tick":
+        if symbol not in self.state_by_symbol or raw_event["kind"] != "tick" or not is_trade_tick_alert_source(raw_event):
             return []
+        return self.process_trade_tick_alert_event(raw_event, trade_date, self.state_by_symbol[symbol])
+
+    def process_trade_tick_alert_event(
+        self,
+        raw_event: dict[str, Any],
+        trade_date: str,
+        state: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """Filter hktransaction ticks before mutating Redis-facing state.
+
+        Full-tick quote snapshots update price/minute state elsewhere. Transaction
+        ticks are high-volume alert candidates: non-big prints are consumed for
+        freshness only, while big prints update the alert read model.
+        """
+        symbol = raw_event["symbol"]
         payload = raw_event["payload"]
         tick = {
             "timestamp": raw_event["source_ts"],
@@ -605,9 +623,9 @@ class OctopusComputeV2:
         }
         bod = self.bod_by_symbol.get(symbol)
         if not is_big_trade(tick, bod, self.big_trade_volume_baseline_ratio):
+            self.health.latest_event_at_by_symbol[symbol] = raw_event["source_ts"]
             return []
 
-        state = self.state_by_symbol[symbol]
         self.seq_by_symbol[symbol] += 1
         alert = make_big_trade_alert(raw_event, tick, bod)
         state["alerts"] = [alert, *state["alerts"]][:500]
@@ -952,6 +970,18 @@ def is_big_trade(
     if bod and bod.volume_baseline > 0 and volume_baseline_ratio > 0:
         return int(tick["volume"]) >= bod.volume_baseline * volume_baseline_ratio
     return False
+
+
+def is_full_tick_seed_event(raw_event: dict[str, Any]) -> bool:
+    return raw_event.get("period") == "full_tick" or raw_event.get("source") == "xtquant_full_tick"
+
+
+def is_trade_tick_alert_source(raw_event: dict[str, Any]) -> bool:
+    period = str(raw_event.get("period") or "").strip().lower()
+    source = str(raw_event.get("source") or "").strip().lower()
+    if period in {"hktransaction", "trade_tick", "tick"}:
+        return True
+    return source in {"mammoth", "mammoth-real-data-runner"}
 
 
 def make_big_trade_alert(raw_event: dict[str, Any], tick: dict[str, Any], bod: BodState | None = None) -> dict[str, Any]:

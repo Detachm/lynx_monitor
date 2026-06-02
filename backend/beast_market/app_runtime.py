@@ -1143,6 +1143,7 @@ def backfill_trade_tick_events(
                 kind="tick",
                 symbol=symbol,
                 source="mammoth",
+                period="hktransaction",
                 seq=runtime.octopus.seq_by_symbol[symbol],
                 source_ts=tick_ts,
                 payload=payload,
